@@ -147,7 +147,8 @@ EXPORT int nvmlDeviceSetPowerManagementLimit(void* d, unsigned mw) {
 
 EXPORT int nvmlDeviceGetUtilizationRates(void* d, Utilization* u) { u->gpu = 97; u->memory = 41; return OK; }
 EXPORT int nvmlDeviceGetPerformanceState(void* d, unsigned* p) { *p = 0; return OK; }
-EXPORT int nvmlDeviceGetCurrentClocksEventReasons(void* d, unsigned long long* r) { *r = 0x4; return OK; }
+// Limitada por potencia (0x4) solo de serie: con un tope de reloj se queda por debajo del límite.
+EXPORT int nvmlDeviceGetCurrentClocksEventReasons(void* d, unsigned long long* r) { *r = load().lockMax ? 0 : 0x4; return OK; }
 
 EXPORT int nvmlDeviceSetGpuLockedClocks(void* d, unsigned mn, unsigned mx) {
     note("lock %u %u", mn, mx);

@@ -32,7 +32,7 @@ function Get-FakeResult {
     $f = [double]$clock
     $limited = $false
     # Con carga ligera la GPU llega a su reloj máximo sin tocar el límite de potencia.
-    while ($script:Mode -ne [Uv4070.Stress]::Light -and (& $power $f) -gt 200) { $f -= 15; $limited = $true }
+    while ($script:Mode -ne [Uv4070.Stress]::Light -and (& $power $f) -gt $script:FakeLimitW) { $f -= 15; $limited = $true }
     $r = New-Object Uv4070.StressResult
     $r.Batches = 100
     $r.Tflops = $f * 5888 * 2 / 1e6
@@ -79,7 +79,7 @@ function Start-Case([string]$StateJson) {
     $script:LogPath = $null
     $script:SelfTestResults = @()
     if ($StateJson) { Set-Content -LiteralPath (Join-Path (Get-DataDir) 'tune-state.json') -Value $StateJson }
-    $script:FakeLimit = 180; $script:FakeP0 = 100; $script:FailAtStock = $false; $script:FakeVminMHz = 2250
+    $script:FakeLimit = 180; $script:FakeP0 = 100; $script:FailAtStock = $false; $script:FakeVminMHz = 2250; $script:FakeLimitW = 200
     $script:LoseAtOffset = -1; $script:Lost = $false
     $script:Installs = 0; $script:EnginesCreated = 0
     $script:Engine = $null
@@ -113,7 +113,9 @@ Check 'tune: deja aplicada la configuración' ((Get-Content $env:MOCK_NVML_STATE
 Check 'tune: informe guardado y con comparación' ((Get-Content (Join-Path (Get-DataDir) 'tune-report.txt') -Raw -Encoding UTF8) -match 'Consumo.*-\d') $out
 Check 'tune: borra el estado y lo instala con -Yes' (-not (Test-Path (Join-Path (Get-DataDir) 'tune-state.json')) -and $script:Installs -eq 1)
 $summary = Get-Content (Join-Path (Get-DataDir) 'tune-report.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-Check 'tune: tune-report.json con la configuración y la búsqueda' ($summary.config.MaxMHz -eq 2715 -and $summary.highestStableOffset -eq 165 -and @($summary.failed) -contains 180 -and $summary.stock.Watts -gt $summary.final.Watts) ($summary | ConvertTo-Json -Compress -Depth 4)
+Check 'tune: tune-report.json con la configuración y la búsqueda' ($summary.config.MaxMHz -eq 2715 -and $summary.highestStableOffset -eq 165 -and @($summary.failed) -contains 180 -and $summary.stock.Watts -gt $summary.final.Watts -and $summary.stockCold.Watts -eq $summary.stock.Watts) ($summary | ConvertTo-Json -Compress -Depth 4)
+$steps = @($events | Where-Object { $_.event -eq 'tune-step' })
+Check 'registro: cada paso lleva si la GPU estaba al límite de potencia' (@($steps | Where-Object { $null -ne $_.powerCappedPct }).Count -eq $steps.Count) ($steps | ConvertTo-Json -Compress)
 $events = @(Get-Content -LiteralPath $script:LogPath -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
 $names = @($events | ForEach-Object { $_.event })
 Check 'registro: cada línea es JSON y lleva las decisiones de tune' (@($names | Where-Object { $_ -eq 'tune-step' }).Count -eq 7 -and
@@ -145,10 +147,30 @@ $out = Invoke-Case
 Check 'driver distinto: descarta el estado guardado' ((Read-Config).OffsetMHz -eq 135) $out
 
 # --- Meseta: con la tensión en el mínimo de la curva, más offset ya no ahorra ---
+# Desde +120 la tensión ya es la mínima: +150 y +180 consumen lo mismo y la búsqueda para ahí.
 Start-Case
 $script:FakeVminMHz = 2600
+$script:FakeLimit = 300
 $out = Invoke-Case
-Check 'meseta: para de subir cuando el consumo deja de bajar' ((Read-Config).OffsetMHz -eq 120 -and $out -notmatch '\+180 MHz' -and $out -match 'mínimo de la curva') $out
+Check 'meseta: para tras dos pasos seguidos sin bajar el consumo' ((Read-Config).OffsetMHz -eq 150 -and $out -notmatch '\+210 MHz' -and $out -match 'mínimo de la curva') $out
+
+# --- Al límite de potencia el consumo es constante aunque el undervolt avance: no es una meseta ---
+Start-Case
+$script:FakeLimitW = 150
+$out = Invoke-Case
+Check 'límite de potencia: sigue buscando aunque el consumo no baje' ((Read-Config).OffsetMHz -eq 135 -and $out -match 'al límite de potencia' -and $out -notmatch 'mínimo de la curva') $out
+
+# --- El límite de potencia guardado (install -PowerPct) se conserva y se aplica ---
+Start-Case
+Save-Config ([pscustomobject]@{ MaxMHz = 2600; OffsetMHz = 60; PowerPct = 80 })
+$out = Invoke-Case
+Check 'tune conserva el límite de potencia guardado' ((Read-Config).PowerPct -eq 80 -and (Get-Content $env:MOCK_NVML_STATE) -eq '135 0 2715 160000') "$out $(Get-Content $env:MOCK_NVML_STATE)"
+
+# --- install tras tune conserva la fecha y el driver del ajuste ---
+Start-Case
+Save-Config ([pscustomobject]@{ MaxMHz = 2715; OffsetMHz = 135; PowerPct = 100; Tuned = '2026-10-27 12:00'; Driver = '566.36' })
+$resolved = Resolve-Config $true
+Check 'la configuración resuelta conserva Tuned y Driver' ($resolved.MaxMHz -eq 2715 -and $resolved.Tuned -eq '2026-10-27 12:00' -and $resolved.Driver -eq '566.36') ($resolved | ConvertTo-Json -Compress)
 
 # --- -MaxLossPct cambia el tope ---
 Start-Case
@@ -183,7 +205,7 @@ Check 'stress: configuración estable' ($out -match 'ESTABLE: 10 min' -and (Get-
 
 Start-Case
 $out = try { Invoke-StressTest $script:Dev ([pscustomobject]@{ MaxMHz = 2800; OffsetMHz = 195; PowerPct = 100 }) 10 *>&1 | Out-String } catch { 'EXCEPCION: ' + $_.Exception.Message }
-Check 'stress: configuración inestable' ($out -match 'INESTABLE: errores de cálculo a 2800 MHz.*-OffsetMHz 180') $out
+Check 'stress: configuración inestable, y la GPU vuelve a fábrica' ($out -match 'INESTABLE: errores de cálculo a 2800 MHz.*-OffsetMHz 180' -and (Get-Content $env:MOCK_NVML_STATE) -eq '0 0 0 200000') "$out $(Get-Content $env:MOCK_NVML_STATE)"
 
 Start-Case
 $out = try { Invoke-StressTest $script:Dev ([pscustomobject]@{ MaxMHz = $null; OffsetMHz = $null; PowerPct = 100 }) 1 *>&1 | Out-String } catch { 'EXCEPCION: ' + $_.Exception.Message }
@@ -194,7 +216,7 @@ Start-Case
 $out = try { Invoke-SelfTest $script:Dev *>&1 | Out-String } catch { 'EXCEPCION: ' + $_.Exception.Message }
 $status = @{}
 foreach ($r in $script:SelfTestResults) { $status[$r.Name] = $r.Status }
-$expected = 'lecturas', 'lectura-offset', 'tope-reloj', 'escritura-offset', 'potencia', 'directx11', 'tope-efectivo', 'carga-de-serie', 'pulsos', 'deteccion-errores'
+$expected = 'lecturas', 'lectura-offset', 'tope-reloj', 'escritura-offset', 'potencia', 'directx11', 'tope-efectivo', 'carga-de-serie', 'reloj-maximo', 'pulsos', 'deteccion-errores'
 Check 'selftest: todo correcto con el NVML simulado' ($out -notmatch 'EXCEPCION' -and @($expected | Where-Object { $status[$_] -ne 'ok' }).Count -eq 0) $out
 Check 'selftest: deja la GPU de fábrica' ((Get-Content $env:MOCK_NVML_STATE) -eq '0 0 0 200000') (Get-Content $env:MOCK_NVML_STATE)
 

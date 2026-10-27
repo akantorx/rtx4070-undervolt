@@ -85,8 +85,9 @@ Set-Content -LiteralPath $env:MOCK_NVML_STATE -Value '0 0 0 200000'
 Start-Log 'tune'
 $out = try { Invoke-Tune $device *>&1 | Out-String } catch { 'EXCEPCION: ' + $_.Exception.Message }
 $config = Read-Config
-# El NVML simulado da siempre el mismo consumo: tune para en la meseta tras +60 y deja +30.
-Check 'tune con el motor real (WARP): termina y guarda la configuración' ($out -notmatch 'EXCEPCION' -and $config.MaxMHz -eq 2715 -and $config.OffsetMHz -eq 30) $out
+# El NVML simulado da siempre el mismo consumo y, con tope, no está limitado por potencia: tune
+# para en la meseta tras dos pasos sin bajar (+60 y +90) y deja +60.
+Check 'tune con el motor real (WARP): termina y guarda la configuración' ($out -notmatch 'EXCEPCION' -and $config.MaxMHz -eq 2715 -and $config.OffsetMHz -eq 60) $out
 $events = @(Get-Content -LiteralPath $script:LogPath -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
 Check 'registro de tune: JSON válido con los resultados reales del motor' (@($events | Where-Object { $_.event -eq 'load' -and $_.result.batches -gt 0 }).Count -gt 5) ($events.Count)
 Close-Engine

@@ -882,6 +882,11 @@ function Invoke-Apply($Device, $Config) {
     Write-Host 'Hecho.' -ForegroundColor Green
 }
 
+function Invoke-Reset($Device) {
+    if (-not (Reset-Stock $Device)) { throw 'No se pudo restaurar todo; reinicia el PC para volver a fábrica.' }
+    Write-Host 'Valores de fábrica restaurados.'
+}
+
 # Devuelve $false si algo no se pudo restaurar.
 function Reset-Stock($Device) {
     $ok = $true
@@ -925,9 +930,15 @@ function Save-Config($Config) {
 # Configuración guardada, con -MaxMHz, -OffsetMHz y -PowerPct por encima.
 function Resolve-Config([bool]$Required) {
     $saved = Read-Config
-    $config = [pscustomobject]@{ MaxMHz = $null; OffsetMHz = $null; PowerPct = 100 }
+    $config = [ordered]@{ MaxMHz = $null; OffsetMHz = $null; PowerPct = 100 }
     if ($saved) {
         $config.MaxMHz = [int]$saved.MaxMHz; $config.OffsetMHz = [int]$saved.OffsetMHz; $config.PowerPct = [int]$saved.PowerPct
+        # La fecha y el driver del tune solo valen para el tope y el offset que encontró.
+        if (-not $Bound.ContainsKey('MaxMHz') -and -not $Bound.ContainsKey('OffsetMHz')) {
+            foreach ($key in 'Tuned', 'Driver') {
+                if ($saved.PSObject.Properties[$key]) { $config[$key] = $saved.$key }
+            }
+        }
     }
     if ($Bound.ContainsKey('MaxMHz')) { $config.MaxMHz = $MaxMHz }
     if ($Bound.ContainsKey('OffsetMHz')) { $config.OffsetMHz = $OffsetMHz }
@@ -935,7 +946,7 @@ function Resolve-Config([bool]$Required) {
     if (($null -eq $config.MaxMHz) -ne ($null -eq $config.OffsetMHz) -or ($Required -and $null -eq $config.MaxMHz)) {
         throw 'No hay configuración guardada: ejecuta "tune", o indica -MaxMHz y -OffsetMHz.'
     }
-    $config
+    [pscustomobject]$config
 }
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +1038,10 @@ function Measure-Point($Device, [int]$Cap, [int]$Offset) {
 function Measure-Boost($Device) {
     $r = Invoke-Step $Device 0 0 10 ([Uv4070.Stress]::Light)
     if ($r.Failure) { throw "El test ha fallado de serie con carga ligera: $($r.Failure)." }
+    # Si la GPU sale de P0 entre ráfagas, el reloj medio queda corto y el tope saldría demasiado bajo.
+    if ($r.P0Pct -ge 0 -and $r.P0Pct -lt 90) {
+        throw "La carga ligera no mantiene la GPU en P0 (solo un $([int]$r.P0Pct) % del tiempo): el reloj máximo no sería fiable."
+    }
     $r.ClockMHz
 }
 
@@ -1037,7 +1052,7 @@ function Get-TargetCap([double]$BoostMHz, [int]$LossPct) {
 
 # Un ciclo de estabilidad: carga sostenida en el tope, la misma curva más abajo
 # (cada reloj usa su propio punto de tensión) y pulsos de carga. $Scale alarga cada parte.
-function Test-Stability($Device, [int]$Cap, [int]$Offset, [double]$Scale) {
+function Get-StabilityPlan([int]$Cap) {
     $steadyMode = [Uv4070.Stress]::Steady
     $plan = @(@{ Cap = $Cap; Seconds = 40; Mode = $steadyMode })
     if ($Cap -gt 0) {
@@ -1046,8 +1061,17 @@ function Test-Stability($Device, [int]$Cap, [int]$Offset, [double]$Scale) {
         }
     }
     $plan += @{ Cap = $Cap; Seconds = 15; Mode = [Uv4070.Stress]::Pulses }
+    $plan
+}
+
+# Segundos de un ciclo con $Scale = 1: unos 80 con tope y 55 de serie.
+function Get-StabilityCycleSeconds([int]$Cap) {
+    [int]((Get-StabilityPlan $Cap | ForEach-Object { $_.Seconds } | Measure-Object -Sum).Sum)
+}
+
+function Test-Stability($Device, [int]$Cap, [int]$Offset, [double]$Scale) {
     $steady = $null
-    foreach ($p in $plan) {
+    foreach ($p in (Get-StabilityPlan $Cap)) {
         $r = Invoke-Step $Device $p.Cap $Offset ($p.Seconds * $Scale) $p.Mode
         if ($null -eq $steady) { $steady = $r }
         if ($r.Failure) {
@@ -1120,8 +1144,14 @@ function Invoke-Tune($Device) {
     if (-not $Yes -and (Read-Host '¿Empezar? (s/n)') -notmatch '^[sS]') { return }
 
     $driver = Get-DriverVersion
+    # El límite de potencia guardado (install -PowerPct) se conserva en la configuración nueva.
+    $savedPowerPct = 100
+    try { $saved = Read-Config; if ($saved) { $savedPowerPct = [int]$saved.PowerPct } } catch { }
     $state = Read-TuneState
     if ($state -and ($state.Driver -ne $driver -or $state.LossPct -ne $MaxLossPct)) { $state = $null }
+    if ($state -and $null -eq $state.PSObject.Properties['FlatSteps']) {   # estado de una versión anterior
+        $state | Add-Member -NotePropertyName FlatSteps -NotePropertyValue 0
+    }
     if ($state) {
         Write-Host 'Continuando el ajuste anterior.'
         Write-Log 'tune-resume' @{ state = $state }
@@ -1137,7 +1167,7 @@ function Invoke-Tune($Device) {
     } else {
         $state = [pscustomobject]@{
             Driver = $driver; LossPct = $MaxLossPct; Baseline = $null; BoostMHz = $null; Target = $null
-            Passed = @(); Failed = @(); LastWatts = $null; Plateau = $false; Best = $null; Testing = $null
+            Passed = @(); Failed = @(); LastWatts = $null; FlatSteps = 0; Plateau = $false; Best = $null; Testing = $null
         }
     }
 
@@ -1172,19 +1202,30 @@ function Invoke-Tune($Device) {
                 Save-TuneState $state
                 $result = Test-Stability $Device $target $offset 1
                 $state.Testing = $null
-                Write-Log 'tune-step' @{ target = $target; offset = $offset; failure = $result.Failure; watts = [math]::Round($result.Steady.Watts, 1) }
+                Write-Log 'tune-step' @{
+                    target = $target; offset = $offset; failure = $result.Failure
+                    watts = [math]::Round($result.Steady.Watts, 1); powerCappedPct = [math]::Round($result.Steady.PowerCappedPct, 1)
+                }
                 if ($result.Failure) {
                     $state.Failed = @($state.Failed) + $offset
                     Write-Host ('  +{0,3} MHz  falla: {1}' -f $offset, $result.Failure) -ForegroundColor Yellow
                 } else {
                     $watts = $result.Steady.Watts
-                    # Por debajo de la tensión mínima de la curva, más offset ya no ahorra nada.
-                    if ($null -eq (Get-LowestFail $state.Failed) -and $state.LastWatts -and $watts -ge 0.99 * $state.LastWatts) {
-                        $state.Plateau = $true
+                    # Por debajo de la tensión mínima de la curva, más offset ya no ahorra nada. Solo
+                    # cuenta si la GPU no está pegada al límite de potencia (ahí el consumo es el
+                    # límite, aunque el undervolt siga avanzando) y se repite dos pasos seguidos, por
+                    # el ruido de la medida y porque la GPU, al calentarse, consume algo más.
+                    $capped = $result.Steady.PowerCappedPct -ge 10
+                    if ($null -eq (Get-LowestFail $state.Failed) -and $state.LastWatts -and $watts -ge 0.99 * $state.LastWatts -and -not $capped) {
+                        $state.FlatSteps = [int]$state.FlatSteps + 1
+                        if ($state.FlatSteps -ge 2) { $state.Plateau = $true }
+                    } else {
+                        $state.FlatSteps = 0
                     }
                     $state.LastWatts = $watts
                     $state.Passed = @($state.Passed) + $offset
-                    Write-Host ('  +{0,3} MHz  estable  {1,5:N0} W' -f $offset, $watts)
+                    $limited = if ($capped) { '  (al límite de potencia)' } else { '' }
+                    Write-Host ('  +{0,3} MHz  estable  {1,5:N0} W{2}' -f $offset, $watts, $limited)
                 }
                 Save-TuneState $state
             }
@@ -1213,21 +1254,25 @@ function Invoke-Tune($Device) {
         }
 
         Write-Phase 'Resultado'
+        # La tarjeta de serie se mide otra vez, ya caliente, para compararla en igualdad con la nueva
+        # configuración (la primera medida, con la GPU fría, consume menos por las fugas).
+        $stock = Measure-Point $Device 0 0
         $final = Measure-Point $Device $target $offset
         $config = [pscustomobject]@{
-            MaxMHz = $target; OffsetMHz = $offset; PowerPct = 100
+            MaxMHz = $target; OffsetMHz = $offset; PowerPct = $savedPowerPct
             Tuned = (Get-Date).ToString('yyyy-MM-dd HH:mm'); Driver = $driver
         }
         Save-Config $config
+        if ($config.PowerPct -ne 100) { Set-PowerPct $Device $config.PowerPct }
         $highest = Get-HighestPass $state.Passed $state.Failed
         $summary = [ordered]@{
             version = $ScriptVersion; tuned = $config.Tuned; driver = $driver; lossPct = $MaxLossPct
-            config = $config; boostMHz = $state.BoostMHz; stock = $state.Baseline; final = $final
+            config = $config; boostMHz = $state.BoostMHz; stock = $stock; stockCold = $state.Baseline; final = $final
             highestStableOffset = $highest; marginMHz = $highest - $offset; passed = $state.Passed; failed = $state.Failed; plateau = $state.Plateau
         }
         Write-Log 'tune-result' @{ summary = $summary }
         $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path (Get-DataDir) 'tune-report.json') -Encoding UTF8
-        $report = Format-TuneReport $state.Baseline $state.BoostMHz $final $config $highest
+        $report = Format-TuneReport $stock $state.BoostMHz $final $config $highest
         $report | Set-Content -LiteralPath (Join-Path (Get-DataDir) 'tune-report.txt') -Encoding UTF8
         $report | ForEach-Object { Write-Host $_ }
         Remove-TuneState
@@ -1274,16 +1319,17 @@ function Invoke-StressTest($Device, $Config, [int]$Minutes) {
         $what = "tope $cap MHz, offset +$offset MHz"
     }
     Write-Host "Test de estrés de $Minutes min ($what). Ctrl+C para pararlo."
-    # Cada ciclo de Test-Stability con $Scale = 1 dura unos 80 s.
     $result = $null
     try {
-        $result = Test-Stability $Device $cap $offset ($Minutes * 60 / 80)
+        $result = Test-Stability $Device $cap $offset ($Minutes * 60 / (Get-StabilityCycleSeconds $cap))
     } finally {
         Close-Engine
-        if ($cap -gt 0) { Invoke-Apply $Device $Config } else { [void](Reset-Stock $Device) }
+        # Solo se deja puesta una configuración que ha pasado el test; si falla, o al cancelar, vuelve a fábrica.
+        if ($cap -gt 0 -and $result -and -not $result.Failure) { Invoke-Apply $Device $Config } else { [void](Reset-Stock $Device) }
     }
     if ($result.Failure) {
-        throw "INESTABLE: $($result.Failure). Baja el offset 15 MHz (apply -OffsetMHz $([math]::Max(0, $offset - 15))) o ejecuta tune."
+        throw ("INESTABLE: $($result.Failure). La GPU queda de fábrica hasta el próximo apply o reinicio. " +
+            "Baja el offset 15 MHz (install -OffsetMHz $([math]::Max(0, $offset - 15))) o ejecuta tune.")
     }
     $s = $result.Steady
     Write-Host ('ESTABLE: {0} min sin errores. {1:N1} TFLOPS, {2:N0} W, {3} °C como máximo.' -f $Minutes, $s.Tflops, $s.Watts, $s.MaxTempC) -ForegroundColor Green
@@ -1389,7 +1435,7 @@ function Install-Autostart {
 }
 
 function Uninstall-Autostart {
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    if ((Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) -and (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
     $dir = Get-DataDir
@@ -1536,7 +1582,10 @@ function Invoke-SelfTest($Device) {
             & $add 'carga-de-serie' $(if ($p0) { 'ok' } else { 'fail' }) $detail (ConvertTo-LogResult $r)
 
             $r = Invoke-Step $Device 0 0 6 ([Uv4070.Stress]::Light)
-            & $add 'reloj-maximo' $(if ($r.Failure) { 'fail' } else { 'info' }) ('{0:N0} MHz con carga ligera (P0 {1:N0} %)' -f $r.ClockMHz, $r.P0Pct) (ConvertTo-LogResult $r)
+            # tune saca el tope de este reloj: si la GPU no se queda en P0 con carga ligera, no sirve.
+            $boostOk = -not $r.Failure -and ($r.P0Pct -lt 0 -or $r.P0Pct -ge 90)
+            $boostDetail = if ($r.Failure) { $r.Failure } else { '{0:N0} MHz con carga ligera (P0 {1:N0} %)' -f $r.ClockMHz, $r.P0Pct }
+            & $add 'reloj-maximo' $(if ($boostOk) { 'ok' } else { 'fail' }) $boostDetail (ConvertTo-LogResult $r)
 
             $r = Invoke-Step $Device 0 0 6 ([Uv4070.Stress]::Pulses)
             & $add 'pulsos' $(if ($r.Failure) { 'fail' } else { 'ok' }) $(if ($r.Failure) { $r.Failure } else { 'carga y reposo sin errores' }) (ConvertTo-LogResult $r)
@@ -1561,10 +1610,11 @@ function Invoke-SelfTest($Device) {
             & $add 'registro-eventos' $(if ($OnWindows) { 'fail' } else { 'info' }) $search.Error $null
         }
 
-        # Tarea programada como la de install, pero desactivada y temporal.
+        # Tarea programada como la de install, pero desactivada y temporal. Apunta a la copia de
+        # Program Files (exista o no): una tarea SYSTEM nunca debe señalar a una carpeta del usuario.
         if (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue) {
             try {
-                $task = Register-AutostartTask 'uv4070-selftest' $PSCommandPath $true
+                $task = Register-AutostartTask 'uv4070-selftest' (Join-Path (Get-DataDir) 'uv4070.ps1') $true
                 $ok = @($task.Triggers).Count -eq 2 -and $task.Principal.UserId -eq 'SYSTEM'
                 & $add 'tarea-programada' $(if ($ok) { 'ok' } else { 'fail' }) ('{0} disparadores, usuario {1}' -f @($task.Triggers).Count, $task.Principal.UserId) $null
             } catch {
@@ -1602,7 +1652,8 @@ function Export-Report($Device, [string]$OpenError) {
     if (Test-Path -LiteralPath $logDir) {
         # Los 3 últimos de cada comando (el nombre es yyyyMMdd-HHmmss-<comando>.jsonl), para que
         # los apply del arranque no dejen fuera el último tune.
-        $recent = Get-ChildItem -LiteralPath $logDir -Filter '*.jsonl' | Group-Object { $_.BaseName.Substring(16) } |
+        $recent = Get-ChildItem -LiteralPath $logDir -Filter '*.jsonl' | Where-Object { $_.BaseName -match '^\d{8}-\d{6}-.' } |
+            Group-Object { $_.BaseName -replace '^\d{8}-\d{6}-', '' } |
             ForEach-Object { $_.Group | Sort-Object Name -Descending | Select-Object -First 3 }
         foreach ($file in ($recent | Sort-Object Name)) {
             $events = @(Get-Content -LiteralPath $file.FullName -Encoding UTF8 | Where-Object { $_ } | ForEach-Object {
@@ -1614,8 +1665,15 @@ function Export-Report($Device, [string]$OpenError) {
     $transcript = Join-Path $dir 'uv4070.log'
     $autostartLog = $null
     if (Test-Path -LiteralPath $transcript) {
-        # Sin la cabecera de Start-Transcript, que trae usuario y nombre del equipo.
-        $autostartLog = @(Get-Content -LiteralPath $transcript -Encoding UTF8 | Where-Object { $_ -notmatch '^(Username|RunAs User|Machine|Host Application|Process ID|Configuration Name):' }) -join "`n"
+        # Sin la cabecera ni el pie de Start-Transcript, que traen usuario y nombre del equipo con
+        # etiquetas en el idioma de Windows: son los bloques entre líneas de asteriscos.
+        $kept = @()
+        $inBlock = $false
+        foreach ($line in @(Get-Content -LiteralPath $transcript -Encoding UTF8)) {
+            if ($line -match '^\*{10,}\s*$') { $inBlock = -not $inBlock; continue }
+            if (-not $inBlock) { $kept += $line }
+        }
+        $autostartLog = $kept -join "`n"
     }
     $report = [ordered]@{
         about = ('Informe de uv4070 ' + $ScriptVersion + ', undervolt de una RTX 4070 por NVML: tope de reloj (cap, MHz) + ' +
@@ -1634,8 +1692,13 @@ function Export-Report($Device, [string]$OpenError) {
         logs = $logs
     }
     $json = $report | ConvertTo-Json -Depth 10
-    # Sin el nombre de usuario en las rutas (p. ej. en los errores).
+    # Sin el nombre de usuario en las rutas (p. ej. en los errores), ni el nombre del equipo o del
+    # usuario sueltos (p. ej. en mensajes). Los nombres de menos de 3 letras se dejan: serían falsos positivos.
     if ($env:USERNAME) { $json = $json -replace ('(?i)(\\\\Users\\\\)' + [regex]::Escape($env:USERNAME)), '$1%USERNAME%' }
+    foreach ($name in 'COMPUTERNAME', 'USERNAME') {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ($value -and $value.Length -ge 3) { $json = $json -replace ('(?i)\b' + [regex]::Escape($value) + '\b'), "%$name%" }
+    }
     $path = Join-Path (Get-Location).Path ('uv4070-report-{0:yyyyMMdd-HHmmss}.json' -f (Get-Date))
     [IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding $false))
     Write-Host "Informe guardado en: $path"
@@ -1667,9 +1730,13 @@ try {
         }
     }
     # Antes de abrir la GPU, para que funcione aunque ya no haya una 4070.
-    if ($Command -eq 'uninstall') { Uninstall-Autostart }
-
-    if ($Command -eq 'report') {
+    if ($Command -eq 'uninstall') {
+        Uninstall-Autostart
+        # Sin la 4070 (por ejemplo tras cambiar de tarjeta) no queda nada que restaurar.
+        $device = $null
+        try { $device = Open-Rtx4070 $false } catch { Write-Warning "No se restauran valores de fábrica: $($_.Exception.Message)" }
+        if ($device) { Invoke-Reset $device }
+    } elseif ($Command -eq 'report') {
         $device = $null
         $openError = $null
         try { $device = Open-Rtx4070 $false } catch { $openError = $_.Exception.Message }
@@ -1699,10 +1766,7 @@ try {
                 Save-Config $config
                 Install-Autostart
             }
-            { $_ -in 'reset', 'uninstall' } {
-                if (-not (Reset-Stock $device)) { throw 'No se pudo restaurar todo; reinicia el PC para volver a fábrica.' }
-                Write-Host 'Valores de fábrica restaurados.'
-            }
+            'reset'    { Invoke-Reset $device }
         }
     }
 } catch {
