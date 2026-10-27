@@ -22,13 +22,11 @@ gcc "${cflags[@]}" -o "$work/full/nvml.dll" "$root/tests/mock_nvml.c"
 gcc "${cflags[@]}" -DLEGACY_ONLY -o "$work/legacy/nvml.dll" "$root/tests/mock_nvml.c"
 
 state_file="$work/state" log_file="$work/log"
-if (( windows )); then
-    # Git Bash puede tener ProgramFiles y PROGRAMFILES; Windows no distingue mayúsculas y se quedaría con
-    # cualquiera de las dos.
-    while read -r name; do unset "$name"; done < <(compgen -e | grep -ix 'programfiles')
-fi
-MOCK_NVML_STATE=$(native "$state_file") MOCK_NVML_LOG=$(native "$log_file") ProgramFiles=$(native "$work/pf")
-export MOCK_NVML_STATE MOCK_NVML_LOG ProgramFiles
+MOCK_NVML_STATE=$(native "$state_file") MOCK_NVML_LOG=$(native "$log_file")
+export MOCK_NVML_STATE MOCK_NVML_LOG
+# Carpeta de datos de prueba en vez de Program Files. Windows recalcula ProgramFiles al crear cada
+# proceso, así que no basta con exportarla: run la fija dentro de PowerShell.
+data_root=$(native "$work/pf")
 config="$work/pf/uv4070/config.json"
 failures=0
 
@@ -43,8 +41,12 @@ run() {
     local lib=$1; shift
     rm -f "$log_file"
     if [[ -n ${STATE:-} ]]; then echo "$STATE" > "$state_file"; else rm -f "$state_file"; fi
+    # Los argumentos son palabras sueltas (comandos, -Parámetros, números): van tal cual.
+    local command="\$env:ProgramFiles = '$data_root'; & '$(native "$root/uv4070.ps1")' $*"
+    # Un error de parámetros no pone $LASTEXITCODE: se nota en $?.
+    command+="; if (\$?) { exit [int]\$LASTEXITCODE } else { exit [math]::Max(1, [int]\$LASTEXITCODE) }"
     rc=0
-    out=$(pwsh_in "$work/$lib" -File "$(native "$root/uv4070.ps1")" "$@" 2>&1) || rc=$?
+    out=$(pwsh_in "$work/$lib" -Command "$command" 2>&1) || rc=$?
     calls=$(paste -sd '|' "$log_file" 2>/dev/null || true)
 }
 
@@ -55,12 +57,6 @@ check() {  # check <nombre> <condición...>
         echo "$out" | sed 's/^/  | /'; failures=$((failures + 1))
     fi
 }
-
-seen=$("$pwsh" -NoProfile -NonInteractive -Command '$env:ProgramFiles' | tr -d '\r')
-if [[ $seen != "$ProgramFiles" ]]; then
-    echo "PowerShell ve ProgramFiles=$seen en vez de $ProgramFiles: las pruebas usarían la carpeta real." >&2
-    exit 1
-fi
 
 run full status
 check 'status muestra la GPU, el offset y que no hay configuración' \
