@@ -4,8 +4,8 @@ Undervolt automático para **una NVIDIA GeForce RTX 4070** en Windows, en un sol
 Sin MSI Afterburner, sin programa en segundo plano, sin perfiles.
 
 Ejecutas `tune` una vez (unos 25 minutos) y te deja **una configuración para todo**: la que menos
-consume perdiendo como mucho un 3 % de reloj respecto a serie. Antes de guardarla, la valida con su
-propio test de estrés.
+consume perdiendo como mucho un 1 % de reloj respecto a serie, es decir, el mismo rendimiento con menos
+tensión, consumo y temperatura. Antes de guardarla, la valida con su propio test de estrés.
 
 ## Uso
 
@@ -31,21 +31,32 @@ que "subir la curva y aplanarla" en Afterburner.
 
 1. **Mide la tarjeta de serie**: rendimiento, consumo y 1 % low con carga máxima, y el reloj máximo con
    una carga ligera, como la de un juego que no llega al límite de potencia.
-2. **Fija el tope** un 3 % por debajo de ese reloj máximo y **sube el offset**, es decir, baja la
+2. **Fija el tope** un 1 % por debajo de ese reloj máximo y **sube el offset**, es decir, baja la
    tensión, de 30 en 30 MHz. Cada paso pasa el test de estrés completo. Al primer fallo afina en pasos de 15 y deja
-   **30 MHz de margen** bajo el último valor estable. Si dos pasos seguidos más offset ya no reduce el
+   **30 MHz de margen** bajo el último valor estable (`-MarginMHz`). Si dos pasos seguidos más offset ya no reduce el
    consumo (la tensión ya está en el mínimo de la curva), se detiene sin arriesgar más. Mientras la GPU
    está pegada al límite de potencia el consumo no baja aunque el undervolt avance, así que ahí no cuenta.
 3. **Confirma** el resultado con unos 10 minutos más de estrés. Si falla, baja 15 MHz y vuelve a confirmar.
    Al final vuelve a medir la tarjeta de serie, ya caliente, para que la comparación sea justa. Si tenías
    un límite de potencia guardado (`install -PowerPct`), lo conserva.
 
-¿Por qué así? La parte alta de la curva es donde la 4070 gasta más tensión para muy poco reloj. Renunciar
-a ese 3 % y quitarle a la vez la tensión que tu chip no necesita es lo que más reduce el consumo. Además,
-el reloj deja de rebotar contra el límite de potencia, y eso mejora los 1 % low.
+¿Por qué un 1 % y no 0? El reloj máximo se mide con carga ligera y tiene algo de ruido; ese 1 % (unos
+30 MHz) quita solo el escalón más alto de la curva, donde de serie la 4070 gasta más tensión para muy poco
+reloj y donde casi nunca está en un juego. Dentro del límite de potencia la tarjeta sostiene más reloj que
+de serie, porque cada MHz le cuesta menos tensión, así que en los juegos que llegan a los 200 W el
+rendimiento se mantiene o sube y los 1 % low mejoran porque el reloj deja de rebotar contra el límite.
 
-Si prefieres ahorrar más a cambio de algo más de rendimiento: `.\uv4070.cmd tune -MaxLossPct 6`
-(de 0 a 15).
+**Qué objetivo elegir** (`-MaxLossPct`, de 0 a 15):
+
+| Objetivo | Comando | Qué esperar |
+|---|---|---|
+| Rendimiento (por defecto) | `tune` | Mismos FPS, menos consumo y temperatura. |
+| Eficiencia | `tune -MaxLossPct 3` | 2 o 3 FPS menos de 100 en juegos ligeros; más ahorro. |
+| Silencio | `tune -MaxLossPct 6` y luego `install -PowerPct 85` | Algo menos de FPS; ventiladores mucho más bajos. |
+
+**Qué margen dejar** (`-MarginMHz`: 0, 15, 30, 45, 60, 75 o 90): 30 por defecto, unos 10 mV por debajo
+del límite estable del chip. Con 45 renuncias a unos 5 mV más de ahorro, que es casi nada, y es lo que
+recomiendo si juegas mucho con ray tracing y no quieres iterar (ver abajo).
 
 Si el PC llega a colgarse durante la búsqueda, reinícialo y vuelve a ejecutar `tune`: sigue donde lo
 dejó y cuenta ese paso como inestable.
@@ -74,6 +85,23 @@ Para probar tu configuración cuando quieras, por ejemplo tras actualizar el dri
 
 Si el test falla, la GPU vuelve a valores de fábrica hasta el próximo `apply` o reinicio; si pasa, la
 configuración se queda aplicada.
+
+## Prueba con ray tracing
+
+Los núcleos de ray tracing y los tensor son transistores distintos de los de cálculo y consumen con otro
+patrón, con picos de corriente más bruscos que hacen caer la tensión un instante. Un undervolt que aguanta
+diez minutos de cálculo puro puede fallar en una escena con reflejos. El test del script no los carga
+(es DirectX 11; RT necesita DirectX 12), así que el examen final lo pones tú:
+
+1. Tras `tune`, juega **30-60 minutos seguidos** a algo con RT pesado: Cyberpunk 2077 con path tracing,
+   Alan Wake 2 o Control, con la calidad al máximo y sin límite de FPS, para que la GPU esté a tope.
+2. Fallo es cualquiera de estos: el juego se cierra, la pantalla se queda negra un segundo y vuelve,
+   artefactos (puntos o triángulos de colores), o un reinicio del driver. Los reinicios quedan en el
+   registro de Windows y los cuenta `selftest` ("registro-eventos") y `report`.
+3. Si falla, baja el offset 15 MHz y repite: `.\uv4070.cmd install -OffsetMHz <valor - 15>`. Dos fallos
+   seguidos: baja otros 15 o vuelve a ejecutar `tune -MarginMHz 45`.
+4. Repite la prueba cuando cambie el entorno: driver nuevo, o el primer día de calor del verano. Con
+   10 grados más de ambiente la tensión mínima estable sube, y ahí es donde se nota un margen justo.
 
 ## Otros comandos
 
@@ -163,9 +191,8 @@ IA, o a quien te ayude, para revisar un fallo o afinar el ajuste.
   Lo que solo se ve con tu tarjeta (cómo responde el driver de NVIDIA, si la carga llega a P0, las cifras
   reales) es justo lo que comprueba `selftest`. Si algo falla, el script vuelve a fábrica y muestra el error.
 - El test de estrés carga los núcleos de cálculo, que es lo que limita un undervolt, pero no los de
-  ray tracing ni los tensor. Tras `tune`, juega a algo exigente con RT. Si un juego se cierra o el driver
-  se reinicia, baja el offset 15 MHz (`.\uv4070.cmd install -OffsetMHz <valor - 15>`).
-- El rendimiento que mide es el de su propia carga. En juegos, la pérdida de reloj del 3 % suele notarse
+  ray tracing ni los tensor. Ver "Prueba con ray tracing".
+- El rendimiento que mide es el de su propia carga. En juegos, la pérdida de reloj suele notarse
   menos en FPS.
 - NVML no permite leer la tensión ni el tope activo: para ver la tensión usa HWiNFO o GPU-Z.
 - No incluye control de ventiladores, overclock de memoria ni perfiles por juego.

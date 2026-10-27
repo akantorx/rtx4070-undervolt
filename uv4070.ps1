@@ -4,10 +4,10 @@
 
 .DESCRIPTION
     "tune" encuentra solo la configuración para tu tarjeta y la guarda: la que
-    menos consume perdiendo como mucho un 3 % de reloj (-MaxLossPct). Mide la
+    menos consume perdiendo como mucho un 1 % de reloj (-MaxLossPct). Mide la
     tarjeta de serie, pone el tope, baja la tensión hasta el límite estable de
-    tu chip con un test de estrés propio, deja un margen de seguridad y lo
-    confirma con unos 10 minutos más de estrés.
+    tu chip con un test de estrés propio, deja un margen de seguridad
+    (-MarginMHz, 30 por defecto) y lo confirma con unos 10 minutos más de estrés.
 
     El undervolt se hace con NVML (nvml.dll, la librería oficial del driver de
     NVIDIA): un tope al reloj del núcleo y un offset que sube toda la curva
@@ -60,9 +60,14 @@ param(
     [int]$PowerPct = 100,
 
     # Solo para tune: cuánto reloj máximo se puede perder frente a serie a cambio
-    # de consumir menos. Más = más ahorro.
+    # de consumir menos. Más = más ahorro; 0 = todo el rendimiento.
     [ValidateRange(0, 15)]
-    [int]$MaxLossPct = 3,
+    [int]$MaxLossPct = 1,
+
+    # Solo para tune: margen bajo el último offset estable. 45 si juegas mucho con
+    # ray tracing y no quieres iterar.
+    [ValidateSet(0, 15, 30, 45, 60, 75, 90)]
+    [int]$MarginMHz = 30,
 
     # Solo para stress: duración en minutos.
     [ValidateRange(1, 600)]
@@ -90,7 +95,6 @@ $Bound = $PSBoundParameters
 
 # Ajuste automático (tune). Los relojes van en múltiplos de 15 MHz, el paso de Ada.
 $OffsetStep = 30       # búsqueda gruesa; después afina en pasos de 15
-$OffsetMargin = 30     # margen de seguridad bajo el último offset estable
 $ConfirmScale = 7      # la confirmación dura 7 rondas de búsqueda (unos 10 minutos)
 $WarmupSeconds = 60
 $SafeMHz = 1500        # reloj al que se calcula la referencia del test de estrés
@@ -1136,7 +1140,7 @@ function Invoke-Tune($Device) {
     Write-Host "tune busca la configuración que menos consume perdiendo como mucho un $MaxLossPct % de reloj (unos 25 minutos):"
     Write-Host '  1. Mide la tarjeta de serie: rendimiento, consumo y reloj máximo.'
     Write-Host "  2. Con el tope un $MaxLossPct % por debajo de ese reloj, sube la curva (menos tensión) hasta que"
-    Write-Host "     el test de estrés falla, y deja $OffsetMargin MHz de margen."
+    Write-Host "     el test de estrés falla, y deja $MarginMHz MHz de margen."
     Write-Host '  3. Lo confirma con unos 10 minutos más de estrés y lo guarda.'
     Write-Host 'Cierra juegos, navegadores y todo lo que use la GPU. Puede que la pantalla parpadee o que'
     Write-Host 'el driver se reinicie: es normal y no daña la tarjeta. Si el PC se llega a colgar,'
@@ -1148,10 +1152,12 @@ function Invoke-Tune($Device) {
     $savedPowerPct = 100
     try { $saved = Read-Config; if ($saved) { $savedPowerPct = [int]$saved.PowerPct } } catch { }
     $state = Read-TuneState
-    if ($state -and ($state.Driver -ne $driver -or $state.LossPct -ne $MaxLossPct)) { $state = $null }
-    if ($state -and $null -eq $state.PSObject.Properties['FlatSteps']) {   # estado de una versión anterior
-        $state | Add-Member -NotePropertyName FlatSteps -NotePropertyValue 0
+    if ($state) {   # claves de versiones anteriores del estado
+        foreach ($missing in @{ FlatSteps = 0; MarginMHz = 30 }.GetEnumerator()) {
+            if ($null -eq $state.PSObject.Properties[$missing.Key]) { $state | Add-Member -NotePropertyName $missing.Key -NotePropertyValue $missing.Value }
+        }
     }
+    if ($state -and ($state.Driver -ne $driver -or $state.LossPct -ne $MaxLossPct -or $state.MarginMHz -ne $MarginMHz)) { $state = $null }
     if ($state) {
         Write-Host 'Continuando el ajuste anterior.'
         Write-Log 'tune-resume' @{ state = $state }
@@ -1166,7 +1172,7 @@ function Invoke-Tune($Device) {
         }
     } else {
         $state = [pscustomobject]@{
-            Driver = $driver; LossPct = $MaxLossPct; Baseline = $null; BoostMHz = $null; Target = $null
+            Driver = $driver; LossPct = $MaxLossPct; MarginMHz = $MarginMHz; Baseline = $null; BoostMHz = $null; Target = $null
             Passed = @(); Failed = @(); LastWatts = $null; FlatSteps = 0; Plateau = $false; Best = $null; Testing = $null
         }
     }
@@ -1230,7 +1236,7 @@ function Invoke-Tune($Device) {
                 Save-TuneState $state
             }
             $highest = Get-HighestPass $state.Passed $state.Failed
-            $state.Best = [math]::Max(0, $highest - $OffsetMargin)
+            $state.Best = [math]::Max(0, $highest - $MarginMHz)
             Save-TuneState $state
             Write-Log 'tune-best' @{ highest = $highest; best = $state.Best; plateau = $state.Plateau; passed = $state.Passed; failed = $state.Failed }
             if ($state.Plateau) { Write-Host 'Más offset ya no baja el consumo: la tensión ya está en el mínimo de la curva.' }
@@ -1266,7 +1272,7 @@ function Invoke-Tune($Device) {
         if ($config.PowerPct -ne 100) { Set-PowerPct $Device $config.PowerPct }
         $highest = Get-HighestPass $state.Passed $state.Failed
         $summary = [ordered]@{
-            version = $ScriptVersion; tuned = $config.Tuned; driver = $driver; lossPct = $MaxLossPct
+            version = $ScriptVersion; tuned = $config.Tuned; driver = $driver; lossPct = $MaxLossPct; marginMHz = $MarginMHz
             config = $config; boostMHz = $state.BoostMHz; stock = $stock; stockCold = $state.Baseline; final = $final
             highestStableOffset = $highest; marginMHz = $highest - $offset; passed = $state.Passed; failed = $state.Failed; plateau = $state.Plateau
         }

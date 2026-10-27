@@ -7,10 +7,7 @@ $root = Split-Path -Parent $PSScriptRoot
 # Fallos del NVML simulado desde este proceso (el entorno no sirve: .NET no cambia el que ve getenv).
 Add-Type -Namespace Uv4070Tests -Name Mock -MemberDefinition '[DllImport("nvml.dll")] public static extern void mockSetFail(string flags);'
 
-$Yes = $true
 $script:Failures = 0
-$script:Installs = 0
-$script:EnginesCreated = 0
 
 function Check([string]$Name, [bool]$Ok, $Detail) {
     if ($Ok) { Write-Host "ok    $Name" } else {
@@ -19,6 +16,15 @@ function Check([string]$Name, [bool]$Ok, $Detail) {
         $script:Failures++
     }
 }
+
+# Valores por defecto del script, antes de fijar los que usan estas pruebas.
+Check 'por defecto: 1 % de pérdida de reloj y 30 MHz de margen' ($MaxLossPct -eq 1 -and $MarginMHz -eq 30) "$MaxLossPct $MarginMHz"
+Check 'tope por defecto: 1 % por debajo de 2805 son 2775' ((Get-TargetCap 2805 $MaxLossPct) -eq 2775)
+
+$Yes = $true
+$MaxLossPct = 3   # las cifras de estas pruebas están calculadas con un 3 %
+$script:Installs = 0
+$script:EnginesCreated = 0
 
 function Install-Autostart { $script:Installs++ }
 
@@ -178,6 +184,18 @@ $MaxLossPct = 10
 $out = Invoke-Case
 Check '-MaxLossPct 10: tope 2520' ((Read-Config).MaxMHz -eq 2520) $out
 $MaxLossPct = 3
+
+# --- -MarginMHz cambia el margen bajo el último offset estable ---
+Start-Case
+$MarginMHz = 45
+$out = Invoke-Case
+Check '-MarginMHz 45: máximo estable 165 - 45' ((Read-Config).OffsetMHz -eq 120) $out
+$MarginMHz = 30
+
+# --- Un estado guardado con otro margen se descarta ---
+Start-Case '{"Driver":"566.36","LossPct":3,"MarginMHz":45,"Baseline":null,"BoostMHz":2805,"Target":2715,"Passed":[30,60,90],"Failed":[],"LastWatts":190,"FlatSteps":0,"Plateau":false,"Best":null,"Testing":null}'
+$out = Invoke-Case
+Check 'otro margen: descarta el estado guardado y empieza de cero' ($out -notmatch 'Continuando' -and (Read-Config).OffsetMHz -eq 135) $out
 
 # --- Reinicio del driver: se abre otro motor y cuenta como fallo ---
 Start-Case
