@@ -935,7 +935,7 @@ void main(uint3 id : SV_DispatchThreadID)
         [StructLayout(LayoutKind.Sequential)] struct Options5 { public int SrvOnlyTiledResourceTier3; public uint RenderPassesTier, RaytracingTier; }  // 12 bytes
 
         const uint HeapDefault = 1, HeapUpload = 2, HeapReadback = 3;
-        const uint FlagAllowUav = 0x8;
+        const uint FlagAllowUav = 0x4;  // D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
         const uint StateCommon = 0, StateUav = 0x8, StateCopyDest = 0x400, StateCopySource = 0x800, StateGenericRead = 0xAC3, StateAccelerationStructure = 0x400000;
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateCommandQueueFn(IntPtr self, ref QueueDesc desc, ref Guid riid, out IntPtr queue);
