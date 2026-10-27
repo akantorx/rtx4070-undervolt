@@ -62,12 +62,28 @@ try {
 $message = try { [Uv4070.Stress]::Open($GpuName).Dispose(); 'abrió' } catch { $_.Exception.InnerException.Message }
 Check 'DirectX: sin la 4070 lo dice y lista los adaptadores' ($message -match 'DirectX no encuentra' -and $message -match [regex]::Escape($warp)) $message
 
+# --- Test de ray tracing (DirectX 12, DXR 1.1) sobre WARP ---
+$warpRt = [Uv4070.RtStress]::Open($warp)
+try {
+    $warpRt.Calibrate(15)
+    $warpRt.CaptureReference()
+    Check ('WARP RT: calibración y referencia ({0} rayos por hilo, {1:N1} ms por dispatch)' -f $warpRt.Iterations, $warpRt.DispatchMs) ($warpRt.Iterations -ge 1 -and $warpRt.DispatchMs -gt 0)
+    $r = $warpRt.Run(3, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
+    Check 'WARP RT: carga sostenida sin errores' (-not $r.Failure -and $r.Batches -gt 1) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
+    $warpRt.Iterations += 1
+    $r = $warpRt.Run(1, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
+    Check 'WARP RT: detecta resultados erróneos' ($r.Failure -eq 'errores de cálculo' -and $r.Errors -ge [Uv4070.RtStress]::Threads) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
+} finally {
+    $warpRt.Dispose()
+}
+
 # --- Registro de eventos ---
 $search = Search-DriverResets (Get-Date).AddDays(-30)
 Check 'registro de eventos: la consulta de nvlddmkm y Display funciona' $search.Ok $search.Error
 
 # --- selftest y tune con el motor real (WARP) y el NVML simulado ---
 function New-StressEngine { [Uv4070.Stress]::Open($warp) }
+function New-RtStressEngine { [Uv4070.RtStress]::Open($warp) }
 function Install-Autostart { }
 $TestScale = 0.05
 $env:ProgramFiles = Join-Path ([IO.Path]::GetTempPath()) ('uv4070-ci-' + [guid]::NewGuid())

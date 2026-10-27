@@ -3,7 +3,7 @@
 Undervolt automático para **una NVIDIA GeForce RTX 4070** en Windows, en un solo script de PowerShell.
 Sin MSI Afterburner, sin programa en segundo plano, sin perfiles.
 
-Ejecutas `tune` una vez (unos 25 minutos) y te deja **una configuración para todo**: la que menos
+Ejecutas `tune` una vez (unos 30 minutos) y te deja **una configuración para todo**: la que menos
 consume perdiendo como mucho un 1 % de reloj respecto a serie, es decir, el mismo rendimiento con menos
 tensión, consumo y temperatura. Antes de guardarla, la valida con su propio test de estrés.
 
@@ -63,16 +63,22 @@ dejó y cuenta ese paso como inestable.
 
 ## El test de estrés
 
-Va incluido en el script y no necesita nada aparte. Es un compute shader de DirectX 11 que pone a
-trabajar todas las unidades FP32 de la GPU:
+Va incluido en el script y no necesita nada aparte. Son dos cargas: un compute shader de DirectX 11
+que pone a trabajar todas las unidades FP32 de la GPU, y un shader de ray tracing de DirectX 12
+(DXR 1.1) que carga los núcleos RT, que consumen con otro patrón.
 
 - Cada hilo calcula 8 cadenas caóticas (`x = x·x + c`, una FMA por paso) y resume el recorrido en un hash.
   Como son caóticas, un error de cálculo de la GPU cambia el resultado final, y se compara con una
   referencia calculada a 1500 MHz y sin offset, donde cualquier 4070 es estable. Así detecta la
   inestabilidad **antes** de que el driver llegue a colgarse.
+- El de ray tracing lanza rayos contra una nube de triángulos y cada rayo sale del impacto del anterior,
+  así que un impacto mal calculado cambia todos los siguientes y el hash final. Windows no trae el
+  compilador de ese shader, así que va compilado y embebido en el script (`tests/build-rt-shader.ps1`).
 - No solo prueba el tope: también 300, 600 y 900 MHz por debajo, porque el offset desplaza toda la curva
-  y cada reloj usa su propio punto de tensión. Y añade pulsos de carga y reposo, que es donde muchos
-  undervolts fallan, en los cambios bruscos de tensión.
+  y cada reloj usa su propio punto de tensión. Con carga máxima la 4070 se queda en el límite de
+  potencia y no llega al tope, así que añade un tramo de carga ligera, con el que el reloj se queda
+  clavado en el tope como en un juego. Y pulsos de carga y reposo, que es donde muchos undervolts
+  fallan, en los cambios bruscos de tensión.
 - Cuenta como fallo cualquier reinicio del driver (TDR), tanto si lo nota DirectX como si aparece en el
   registro de eventos de Windows.
 
@@ -90,8 +96,9 @@ configuración se queda aplicada.
 
 Los núcleos de ray tracing y los tensor son transistores distintos de los de cálculo y consumen con otro
 patrón, con picos de corriente más bruscos que hacen caer la tensión un instante. Un undervolt que aguanta
-diez minutos de cálculo puro puede fallar en una escena con reflejos. El test del script no los carga
-(es DirectX 11; RT necesita DirectX 12), así que el examen final lo pones tú:
+diez minutos de cálculo puro puede fallar en una escena con reflejos. Por eso el test incluye una carga de
+ray tracing. Los núcleos tensor no se pueden cargar desde un shader normal, y ningún test sintético mezcla
+las cargas como un juego, así que el examen final sigue siendo este:
 
 1. Tras `tune`, juega **30-60 minutos seguidos** a algo con RT pesado: Cyberpunk 2077 con path tracing,
    Alan Wake 2 o Control, con la calidad al máximo y sin límite de FPS, para que la GPU esté a tope.
@@ -128,9 +135,9 @@ los deshace al terminar:
 - que NVML lee reloj, temperatura y consumo;
 - qué API de offset tiene tu driver, y que el tope y el offset se aplican de verdad;
 - el límite de potencia;
-- que el test de estrés arranca en DirectX, que la carga lleva la GPU a P0 y que el tope se respeta
-  con la GPU al máximo;
-- que el detector de errores ve un fallo simulado;
+- que los dos tests de estrés arrancan en DirectX, que la carga lleva la GPU a P0 y que el tope se
+  respeta con la GPU al máximo;
+- que los detectores de errores ven un fallo simulado;
 - el registro de eventos de Windows y una tarea programada como la de `install`.
 
 Cada línea sale como `OK`, `FALLO` o `INFO`.
@@ -183,15 +190,16 @@ IA, o a quien te ayude, para revisar un fallo o afinar el ajuste.
     simulados (`tests/run.sh`).
   - En Windows de verdad, con GitHub Actions y sin GPU (`.github/workflows/tests.yml`):
     - todo lo anterior con Windows PowerShell 5.1 y con PowerShell 7;
-    - el test de estrés sobre el DirectX 11 de Windows por software (WARP);
+    - los dos tests de estrés (DirectX 11 y DirectX 12 con ray tracing) sobre el WARP de Windows, que
+      es DirectX por software;
     - `selftest` y `tune` completos con ese motor;
     - `install`, con la tarea de arranque ejecutándose como SYSTEM, y `uninstall`.
   - El test de estrés también bajo Wine, con el compilador de shaders de Microsoft (`tests/stress-wine.sh`).
 
   Lo que solo se ve con tu tarjeta (cómo responde el driver de NVIDIA, si la carga llega a P0, las cifras
   reales) es justo lo que comprueba `selftest`. Si algo falla, el script vuelve a fábrica y muestra el error.
-- El test de estrés carga los núcleos de cálculo, que es lo que limita un undervolt, pero no los de
-  ray tracing ni los tensor. Ver "Prueba con ray tracing".
+- El test de estrés carga los núcleos de cálculo y los de ray tracing, pero no los tensor, y no mezcla
+  las cargas como un juego. Ver "Prueba con ray tracing".
 - El rendimiento que mide es el de su propia carga. En juegos, la pérdida de reloj suele notarse
   menos en FPS.
 - NVML no permite leer la tensión ni el tope activo: para ver la tensión usa HWiNFO o GPU-Z.

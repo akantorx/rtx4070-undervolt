@@ -9,6 +9,10 @@
     tu chip con un test de estrés propio, deja un margen de seguridad
     (-MarginMHz, 30 por defecto) y lo confirma con unos 10 minutos más de estrés.
 
+    La estabilidad se comprueba con dos tests propios: uno de cálculo (DirectX 11)
+    y otro de ray tracing (DirectX 12), y en cada uno se comparan los resultados
+    con una referencia calculada a 1500 MHz y sin offset.
+
     El undervolt se hace con NVML (nvml.dll, la librería oficial del driver de
     NVIDIA): un tope al reloj del núcleo y un offset que sube toda la curva
     tensión/frecuencia. La GPU llega al tope con menos tensión que de serie y
@@ -17,7 +21,7 @@
 
     Comandos:
       status     Estado actual y configuración guardada (por defecto).
-      tune       Busca la configuración ideal (unos 25 minutos) y la guarda.
+      tune       Busca la configuración ideal (unos 30 minutos) y la guarda.
       stress     Test de estrés de la configuración guardada (-Minutes, 10 por defecto).
       apply      Aplica la configuración guardada, o la de -MaxMHz y -OffsetMHz.
       reset      Vuelve a valores de fábrica.
@@ -284,55 +288,13 @@ namespace Uv4070 {
         public double PowerCappedPct = -1;
     }
 
-    // Test de estrés en DirectX 11 (compute shader), sin librerías externas:
-    // las interfaces COM se llaman por su posición en la tabla virtual.
-    public sealed class Stress : IDisposable {
-        // Modos de Run: carga máxima sostenida; 2 s de carga y 0,7 s de reposo
-        // (cambios bruscos de carga y tensión); y carga ligera (un 25 % del
-        // tiempo), con la que la GPU sube a su reloj máximo sin tocar el límite
-        // de potencia, como en un juego.
-        public const int Steady = 0, Pulses = 1, Light = 2;
-        public const uint Groups = 4096;
-        public const uint Threads = Groups * 256;
-        const uint MaxIterations = 1u << 22;
-        const double BatchMs = 50;
-        const string LostMessage = "el driver se ha reiniciado";
+    // Utilidades COM sin librerías externas: las interfaces se llaman por su
+    // posición en la tabla virtual.
+    static class Com {
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate uint ReleaseFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int EnumAdapters1Fn(IntPtr self, uint index, out IntPtr adapter);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int GetDesc1Fn(IntPtr self, out AdapterDesc1 desc);
 
-        // Cada hilo itera 8 cadenas caóticas x = x*x + c (una FMA por paso) y
-        // resume el recorrido en un hash. Un solo bit erróneo en cualquier paso
-        // cambia el hash final, así que comparar con el hash de referencia detecta
-        // errores de cálculo antes de que el driver llegue a colgarse.
-        const string Shader = @"
-cbuffer Params : register(b0) { uint Iterations; uint Verify; uint2 Unused; };
-RWStructuredBuffer<uint> Reference : register(u0);
-RWStructuredBuffer<uint> Errors : register(u1);
-
-[numthreads(256, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID)
-{
-    uint k;
-    uint seed = id.x * 2654435761u + 12345u;
-    float x[8];
-    [unroll] for (k = 0; k < 8; k++) {
-        seed = seed * 1664525u + 1013904223u;
-        x[k] = (seed >> 8) * (3.0 / 16777216.0) - 1.5;
-    }
-    uint h = seed;
-    [loop] for (uint i = 0; i < Iterations; i++) {
-        [unroll] for (k = 0; k < 8; k++) x[k] = mad(x[k], x[k], -1.8 - 0.0125 * k);
-        h = (h ^ asuint(x[0])) * 16777619u;
-    }
-    [unroll] for (k = 1; k < 8; k++) h = (h ^ asuint(x[k])) * 16777619u;
-    if (Verify == 0) Reference[id.x] = h;
-    else if (Reference[id.x] != h) InterlockedAdd(Errors[0], 1);
-}";
-
-        [StructLayout(LayoutKind.Sequential)]
-        struct BufferDesc { public uint ByteWidth, Usage, BindFlags, CpuAccessFlags, MiscFlags, StructureByteStride; }
-        [StructLayout(LayoutKind.Sequential)]
-        struct UavDesc { public uint Format, ViewDimension, FirstElement, NumElements, Flags; }
-        [StructLayout(LayoutKind.Sequential)]
-        struct Mapped { public IntPtr Data; public uint RowPitch, DepthPitch; }
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         struct AdapterDesc1 {
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Description;
@@ -343,78 +305,26 @@ void main(uint3 id : SV_DispatchThreadID)
             public uint Flags;
         }
 
-        const uint UsageStaging = 3, BindConstantBuffer = 0x4, BindUnorderedAccess = 0x80;
-        const uint CpuAccessRead = 0x20000, MiscStructured = 0x40;
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate uint ReleaseFn(IntPtr self);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int EnumAdapters1Fn(IntPtr self, uint index, out IntPtr adapter);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int GetDesc1Fn(IntPtr self, out AdapterDesc1 desc);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate IntPtr BlobPointerFn(IntPtr self);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate UIntPtr BlobSizeFn(IntPtr self);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateBufferFn(IntPtr self, ref BufferDesc desc, IntPtr initialData, out IntPtr buffer);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateUavFn(IntPtr self, IntPtr resource, ref UavDesc desc, out IntPtr view);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateComputeShaderFn(IntPtr self, IntPtr code, UIntPtr length, IntPtr linkage, out IntPtr shader);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int GetDeviceRemovedReasonFn(IntPtr self);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int MapFn(IntPtr self, IntPtr resource, uint subresource, uint type, uint flags, out Mapped mapped);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void UnmapFn(IntPtr self, IntPtr resource, uint subresource);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void DispatchFn(IntPtr self, uint x, uint y, uint z);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CopyResourceFn(IntPtr self, IntPtr destination, IntPtr source);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void UpdateSubresourceFn(IntPtr self, IntPtr destination, uint subresource, IntPtr box, uint[] data, uint rowPitch, uint depthPitch);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void ClearUavUintFn(IntPtr self, IntPtr view, uint[] values);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CsSetUavsFn(IntPtr self, uint start, uint count, IntPtr[] views, uint[] initialCounts);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CsSetShaderFn(IntPtr self, IntPtr shader, IntPtr instances, uint count);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CsSetConstantBuffersFn(IntPtr self, uint start, uint count, IntPtr[] buffers);
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void ContextFn(IntPtr self);
-
         [DllImport("dxgi.dll")]
         static extern int CreateDXGIFactory1(ref Guid riid, out IntPtr factory);
-        [DllImport("d3d11.dll")]
-        static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software, uint flags, uint[] featureLevels,
-            uint levels, uint sdkVersion, out IntPtr device, out uint featureLevel, out IntPtr context);
-        [DllImport("d3dcompiler_47.dll", CharSet = CharSet.Ansi)]
-        static extern int D3DCompile(byte[] source, UIntPtr size, string name, IntPtr defines, IntPtr include,
-            string entryPoint, string target, uint flags1, uint flags2, out IntPtr code, out IntPtr messages);
 
-        IntPtr device, context, shader, reference, referenceView, errors, errorsView, constants;
-        readonly IntPtr[] staging = new IntPtr[2];
-        MapFn map;
-        UnmapFn unmap;
-        DispatchFn dispatch;
-        CopyResourceFn copyResource;
-        UpdateSubresourceFn updateSubresource;
-        ClearUavUintFn clearUav;
-        ContextFn flush;
-        GetDeviceRemovedReasonFn removedReason;
-
-        public uint Iterations { get; set; }
-        public double DispatchMs { get; private set; }
-        // Tras un reinicio del driver el dispositivo ya no sirve: hay que abrir otro.
-        public bool Lost { get; private set; }
-
-        Stress() { }
-
-        public static Stress Open(string adapterName) {
-            Stress s = new Stress();
-            try { s.Create(adapterName); } catch { s.Dispose(); throw; }
-            return s;
-        }
-
-        static T Fn<T>(IntPtr obj, int index) where T : class {
+        public static T Fn<T>(IntPtr obj, int index) where T : class {
             IntPtr method = Marshal.ReadIntPtr(Marshal.ReadIntPtr(obj), index * IntPtr.Size);
             return (T)(object)Marshal.GetDelegateForFunctionPointer(method, typeof(T));
         }
 
-        static void Release(ref IntPtr obj) {
+        public static void Release(ref IntPtr obj) {
             if (obj == IntPtr.Zero) return;
             Fn<ReleaseFn>(obj, 2)(obj);
             obj = IntPtr.Zero;
         }
 
-        static void Check(int hr, string what) {
+        public static void Check(int hr, string what) {
             if (hr < 0) throw new InvalidOperationException(what + " ha fallado (0x" + hr.ToString("X8") + ")");
         }
 
-        static IntPtr FindAdapter(string name) {
+        // El adaptador DXGI con ese nombre exacto (el llamador lo libera).
+        public static IntPtr FindAdapter(string name) {
             Guid iid = new Guid("770aae78-f26f-4dba-a829-253c83d1b387");  // IDXGIFactory1
             IntPtr factory;
             Check(CreateDXGIFactory1(ref iid, out factory), "CreateDXGIFactory1");
@@ -436,98 +346,42 @@ void main(uint3 id : SV_DispatchThreadID)
             }
             throw new InvalidOperationException("DirectX no encuentra la " + name + " (adaptadores: " + string.Join(", ", seen) + ")");
         }
+    }
 
-        void Create(string adapterName) {
-            IntPtr adapter = FindAdapter(adapterName);
-            try {
-                uint level;
-                // Driver UNKNOWN (0) porque se indica el adaptador; nivel 11_0; SDK 7.
-                Check(D3D11CreateDevice(adapter, 0, IntPtr.Zero, 0, new uint[] { 0xb000 }, 1, 7,
-                    out device, out level, out context), "D3D11CreateDevice");
-            } finally {
-                Release(ref adapter);
-            }
-            map = Fn<MapFn>(context, 14);
-            unmap = Fn<UnmapFn>(context, 15);
-            dispatch = Fn<DispatchFn>(context, 41);
-            copyResource = Fn<CopyResourceFn>(context, 47);
-            updateSubresource = Fn<UpdateSubresourceFn>(context, 48);
-            clearUav = Fn<ClearUavUintFn>(context, 51);
-            flush = Fn<ContextFn>(context, 111);
-            removedReason = Fn<GetDeviceRemovedReasonFn>(device, 39);
+    // Lo común a los dos tests: calibración, referencia, el bucle de carga con
+    // lotes en vuelo, la detección de errores y las lecturas NVML. Cada motor
+    // pone los dispatches y la lectura del contador de errores.
+    public abstract class Engine : IDisposable {
+        // Modos de Run: carga máxima sostenida; 2 s de carga y 0,7 s de reposo
+        // (cambios bruscos de carga y tensión); y carga ligera (un 25 % del
+        // tiempo), con la que la GPU sube a su reloj máximo sin tocar el límite
+        // de potencia, como en un juego.
+        public const int Steady = 0, Pulses = 1, Light = 2;
+        public const uint MaxIterations = 1u << 22;
+        const double BatchMs = 50;
+        const string LostMessage = "el driver se ha reiniciado";
 
-            shader = CompileShader();
-            reference = CreateBuffer(Threads * 4, 0, BindUnorderedAccess, 0, MiscStructured, 4);
-            referenceView = CreateView(reference, Threads);
-            errors = CreateBuffer(16, 0, BindUnorderedAccess, 0, MiscStructured, 4);
-            errorsView = CreateView(errors, 4);
-            for (int i = 0; i < staging.Length; i++) staging[i] = CreateBuffer(16, UsageStaging, 0, CpuAccessRead, MiscStructured, 4);
-            constants = CreateBuffer(16, 0, BindConstantBuffer, 0, 0, 0);
+        public uint Iterations { get; set; }
+        public double DispatchMs { get; private set; }
+        // Tras un reinicio del driver el dispositivo ya no sirve: hay que abrir otro.
+        public bool Lost { get; protected set; }
 
-            Fn<CsSetShaderFn>(context, 69)(context, shader, IntPtr.Zero, 0);
-            Fn<CsSetUavsFn>(context, 68)(context, 0, 2, new IntPtr[] { referenceView, errorsView }, new uint[] { uint.MaxValue, uint.MaxValue });
-            Fn<CsSetConstantBuffersFn>(context, 71)(context, 0, 1, new IntPtr[] { constants });
-        }
-
-        IntPtr CompileShader() {
-            byte[] source = Encoding.ASCII.GetBytes(Shader);
-            IntPtr code, messages;
-            int hr = D3DCompile(source, (UIntPtr)(uint)source.Length, "uv4070", IntPtr.Zero, IntPtr.Zero,
-                "main", "cs_5_0", 1u << 15 /* OPTIMIZATION_LEVEL3 */, 0, out code, out messages);
-            string text = messages != IntPtr.Zero ? Marshal.PtrToStringAnsi(Fn<BlobPointerFn>(messages, 3)(messages)) : "";
-            Release(ref messages);
-            if (hr < 0) throw new InvalidOperationException("No se pudo compilar el test de estrés: " + text);
-            try {
-                IntPtr cs;
-                Check(Fn<CreateComputeShaderFn>(device, 18)(device, Fn<BlobPointerFn>(code, 3)(code),
-                    Fn<BlobSizeFn>(code, 4)(code), IntPtr.Zero, out cs), "CreateComputeShader");
-                return cs;
-            } finally {
-                Release(ref code);
-            }
-        }
-
-        IntPtr CreateBuffer(uint size, uint usage, uint bind, uint cpu, uint misc, uint stride) {
-            BufferDesc d = new BufferDesc();
-            d.ByteWidth = size; d.Usage = usage; d.BindFlags = bind;
-            d.CpuAccessFlags = cpu; d.MiscFlags = misc; d.StructureByteStride = stride;
-            IntPtr buffer;
-            Check(Fn<CreateBufferFn>(device, 3)(device, ref d, IntPtr.Zero, out buffer), "CreateBuffer");
-            return buffer;
-        }
-
-        IntPtr CreateView(IntPtr buffer, uint elements) {
-            UavDesc d = new UavDesc();
-            d.ViewDimension = 1;  // D3D11_UAV_DIMENSION_BUFFER; formato UNKNOWN por ser estructurado
-            d.NumElements = elements;
-            IntPtr view;
-            Check(Fn<CreateUavFn>(device, 8)(device, buffer, ref d, out view), "CreateUnorderedAccessView");
-            return view;
-        }
-
-        void SetParams(uint iterations, uint verify) {
-            updateSubresource(context, constants, 0, IntPtr.Zero, new uint[] { iterations, verify, 0, 0 }, 0, 0);
-        }
-
-        void ClearErrors() {
-            clearUav(context, errorsView, new uint[4]);
-        }
-
-        // Espera a que la GPU termine el lote que copió su contador en staging[slot].
-        bool ReadErrors(int slot, out long count) {
-            count = 0;
-            Mapped m;
-            if (map(context, staging[slot], 0, 1 /* MAP_READ */, 0, out m) < 0) { Lost = true; return false; }
-            count = (uint)Marshal.ReadInt32(m.Data);
-            unmap(context, staging[slot], 0);
-            if (removedReason(device) < 0) { Lost = true; return false; }
-            return true;
-        }
+        public abstract uint ThreadCount { get; }
+        protected abstract int Slots { get; }                 // lotes en vuelo
+        protected abstract double FlopsPerIteration { get; }  // por hilo; 0 si no procede
+        protected virtual uint FirstIterations { get { return 256; } }
+        protected virtual uint MinIterations { get { return 64; } }
+        protected abstract void SetParams(uint iterations, uint verify);
+        protected abstract void ClearErrors();
+        // Encola perBatch dispatches y la copia del contador de errores al slot.
+        protected abstract void Submit(int slot, int perBatch);
+        // Espera al lote del slot y lee su contador; false si el dispositivo se ha perdido.
+        protected abstract bool ReadErrors(int slot, out long count);
+        protected abstract void ReleaseAll(bool wasLost);
 
         double TimeDispatch() {
             Stopwatch sw = Stopwatch.StartNew();
-            dispatch(context, Groups, 1, 1);
-            copyResource(context, staging[0], errors);
+            Submit(0, 1);
             long ignored;
             if (!ReadErrors(0, out ignored)) throw new InvalidOperationException("El driver se ha reiniciado durante la calibración.");
             return sw.Elapsed.TotalMilliseconds;
@@ -536,16 +390,16 @@ void main(uint3 id : SV_DispatchThreadID)
         // Elige las iteraciones para que cada dispatch dure unos targetMs: lo
         // bastante corto para que Windows no lo tome por un cuelgue (2 s).
         public void Calibrate(double targetMs) {
-            SetParams(256, 0);
+            SetParams(FirstIterations, 0);
             for (int i = 0; i < 5; i++) TimeDispatch();
-            uint iterations = 256;
+            uint iterations = FirstIterations;
             for (;;) {
                 SetParams(iterations, 0);
                 double ms = double.MaxValue;
                 for (int i = 0; i < 3; i++) ms = Math.Min(ms, TimeDispatch());
                 if (ms >= targetMs / 4 || iterations >= MaxIterations) {
                     double scaled = iterations * targetMs / Math.Max(ms, 0.001);
-                    Iterations = (uint)Math.Max(64, Math.Min(MaxIterations, scaled));
+                    Iterations = (uint)Math.Max(MinIterations, Math.Min(MaxIterations, scaled));
                     DispatchMs = ms * Iterations / iterations;
                     return;
                 }
@@ -556,11 +410,12 @@ void main(uint3 id : SV_DispatchThreadID)
         // Calcula los hashes de referencia y comprueba que se repiten.
         public void CaptureReference() {
             SetParams(Iterations, 0);
-            dispatch(context, Groups, 1, 1);
+            Submit(0, 1);
+            long ignored;
+            if (!ReadErrors(0, out ignored)) throw new InvalidOperationException("El driver se ha reiniciado al preparar el test.");
             ClearErrors();
             SetParams(Iterations, 1);
-            for (int i = 0; i < 3; i++) dispatch(context, Groups, 1, 1);
-            copyResource(context, staging[0], errors);
+            Submit(0, 3);
             long count;
             if (!ReadErrors(0, out count)) throw new InvalidOperationException("El driver se ha reiniciado al preparar el test.");
             if (count != 0) throw new InvalidOperationException("La GPU no repite sus resultados ni con reloj bajo y sin undervolt.");
@@ -572,8 +427,8 @@ void main(uint3 id : SV_DispatchThreadID)
             ClearErrors();
             SetParams(Iterations, 1);
             int perBatch = mode == Light ? 1 : Math.Max(1, (int)Math.Round(BatchMs / Math.Max(DispatchMs, 0.1)));
-            int depth = mode == Light ? 1 : staging.Length;
-            double flops = (double)Threads * Iterations * 16 * perBatch;
+            int depth = mode == Light ? 1 : Slots;
+            double flops = (double)ThreadCount * Iterations * FlopsPerIteration * perBatch;
             List<double> tflops = new List<double>();
             List<int> queue = new List<int>();  // lotes en vuelo, el más antiguo primero
             Sampler sampler = new Sampler(nvmlDevice);
@@ -582,17 +437,15 @@ void main(uint3 id : SV_DispatchThreadID)
             bool skip = true;  // el primer lote incluye el arranque desde reposo
             int next = 0;
             while (r.Failure == null && total.Elapsed.TotalSeconds < seconds) {
-                // Dos lotes en vuelo para que la GPU no espere a la CPU.
+                // Varios lotes en vuelo para que la GPU no espere a la CPU.
                 while (queue.Count < depth) {
-                    for (int i = 0; i < perBatch; i++) dispatch(context, Groups, 1, 1);
-                    copyResource(context, staging[next], errors);
-                    flush(context);
+                    Submit(next, perBatch);
                     queue.Add(next);
-                    next ^= 1;
+                    next = (next + 1) % Slots;
                 }
                 if (!Complete(Dequeue(queue), r)) break;
                 double now = total.Elapsed.TotalMilliseconds;
-                if (!skip) tflops.Add(flops / ((now - lastDone) / 1000) / 1e12);
+                if (!skip && flops > 0) tflops.Add(flops / ((now - lastDone) / 1000) / 1e12);
                 lastDone = now;
                 skip = false;
                 r.Batches++;
@@ -647,17 +500,9 @@ void main(uint3 id : SV_DispatchThreadID)
         // Después de Dispose el motor cuenta como perdido: Run devuelve un fallo en vez de
         // usar punteros ya liberados.
         public void Dispose() {
-            if (context != IntPtr.Zero && !Lost) Fn<ContextFn>(context, 110)(context);  // ClearState
+            bool wasLost = Lost;
             Lost = true;
-            Release(ref constants);
-            for (int i = 0; i < staging.Length; i++) Release(ref staging[i]);
-            Release(ref errorsView);
-            Release(ref errors);
-            Release(ref referenceView);
-            Release(ref reference);
-            Release(ref shader);
-            Release(ref context);
-            Release(ref device);
+            ReleaseAll(wasLost);
         }
 
         // Lecturas NVML durante la carga, cada 200 ms.
@@ -693,6 +538,632 @@ void main(uint3 id : SV_DispatchThreadID)
                 if (pstates > 0) r.P0Pct = 100.0 * p0 / pstates;
                 if (reasonReads > 0) r.PowerCappedPct = 100.0 * capped / reasonReads;
             }
+        }
+    }
+
+    // Test de cálculo en DirectX 11 (compute shader): carga todas las unidades FP32.
+    public sealed class Stress : Engine {
+        public new const int Steady = Engine.Steady, Pulses = Engine.Pulses, Light = Engine.Light;
+        public const uint Groups = 4096;
+        public const uint Threads = Groups * 256;
+
+        // Cada hilo itera 8 cadenas caóticas x = x*x + c (una FMA por paso) y
+        // resume el recorrido en un hash. Un solo bit erróneo en cualquier paso
+        // cambia el hash final, así que comparar con el hash de referencia detecta
+        // errores de cálculo antes de que el driver llegue a colgarse.
+        const string Shader = @"
+cbuffer Params : register(b0) { uint Iterations; uint Verify; uint2 Unused; };
+RWStructuredBuffer<uint> Reference : register(u0);
+RWStructuredBuffer<uint> Errors : register(u1);
+
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    uint k;
+    uint seed = id.x * 2654435761u + 12345u;
+    float x[8];
+    [unroll] for (k = 0; k < 8; k++) {
+        seed = seed * 1664525u + 1013904223u;
+        x[k] = (seed >> 8) * (3.0 / 16777216.0) - 1.5;
+    }
+    uint h = seed;
+    [loop] for (uint i = 0; i < Iterations; i++) {
+        [unroll] for (k = 0; k < 8; k++) x[k] = mad(x[k], x[k], -1.8 - 0.0125 * k);
+        h = (h ^ asuint(x[0])) * 16777619u;
+    }
+    [unroll] for (k = 1; k < 8; k++) h = (h ^ asuint(x[k])) * 16777619u;
+    if (Verify == 0) Reference[id.x] = h;
+    else if (Reference[id.x] != h) InterlockedAdd(Errors[0], 1);
+}";
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct BufferDesc { public uint ByteWidth, Usage, BindFlags, CpuAccessFlags, MiscFlags, StructureByteStride; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct UavDesc { public uint Format, ViewDimension, FirstElement, NumElements, Flags; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct Mapped { public IntPtr Data; public uint RowPitch, DepthPitch; }
+
+        const uint UsageStaging = 3, BindConstantBuffer = 0x4, BindUnorderedAccess = 0x80;
+        const uint CpuAccessRead = 0x20000, MiscStructured = 0x40;
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate IntPtr BlobPointerFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate UIntPtr BlobSizeFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateBufferFn(IntPtr self, ref BufferDesc desc, IntPtr initialData, out IntPtr buffer);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateUavFn(IntPtr self, IntPtr resource, ref UavDesc desc, out IntPtr view);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateComputeShaderFn(IntPtr self, IntPtr code, UIntPtr length, IntPtr linkage, out IntPtr shader);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int GetDeviceRemovedReasonFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int MapFn(IntPtr self, IntPtr resource, uint subresource, uint type, uint flags, out Mapped mapped);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void UnmapFn(IntPtr self, IntPtr resource, uint subresource);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void DispatchFn(IntPtr self, uint x, uint y, uint z);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CopyResourceFn(IntPtr self, IntPtr destination, IntPtr source);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void UpdateSubresourceFn(IntPtr self, IntPtr destination, uint subresource, IntPtr box, uint[] data, uint rowPitch, uint depthPitch);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void ClearUavUintFn(IntPtr self, IntPtr view, uint[] values);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CsSetUavsFn(IntPtr self, uint start, uint count, IntPtr[] views, uint[] initialCounts);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CsSetShaderFn(IntPtr self, IntPtr shader, IntPtr instances, uint count);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CsSetConstantBuffersFn(IntPtr self, uint start, uint count, IntPtr[] buffers);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void ContextFn(IntPtr self);
+
+        [DllImport("d3d11.dll")]
+        static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software, uint flags, uint[] featureLevels,
+            uint levels, uint sdkVersion, out IntPtr device, out uint featureLevel, out IntPtr context);
+        [DllImport("d3dcompiler_47.dll", CharSet = CharSet.Ansi)]
+        static extern int D3DCompile(byte[] source, UIntPtr size, string name, IntPtr defines, IntPtr include,
+            string entryPoint, string target, uint flags1, uint flags2, out IntPtr code, out IntPtr messages);
+
+        IntPtr device, context, shader, reference, referenceView, errors, errorsView, constants;
+        readonly IntPtr[] staging = new IntPtr[2];
+        MapFn map;
+        UnmapFn unmap;
+        DispatchFn dispatch;
+        CopyResourceFn copyResource;
+        UpdateSubresourceFn updateSubresource;
+        ClearUavUintFn clearUav;
+        ContextFn flush;
+        GetDeviceRemovedReasonFn removedReason;
+
+        public override uint ThreadCount { get { return Threads; } }
+        protected override int Slots { get { return staging.Length; } }
+        protected override double FlopsPerIteration { get { return 16; } }
+
+        Stress() { }
+
+        public static Stress Open(string adapterName) {
+            Stress s = new Stress();
+            try { s.Create(adapterName); } catch { s.Dispose(); throw; }
+            return s;
+        }
+
+        void Create(string adapterName) {
+            IntPtr adapter = Com.FindAdapter(adapterName);
+            try {
+                uint level;
+                // Driver UNKNOWN (0) porque se indica el adaptador; nivel 11_0; SDK 7.
+                Com.Check(D3D11CreateDevice(adapter, 0, IntPtr.Zero, 0, new uint[] { 0xb000 }, 1, 7,
+                    out device, out level, out context), "D3D11CreateDevice");
+            } finally {
+                Com.Release(ref adapter);
+            }
+            map = Com.Fn<MapFn>(context, 14);
+            unmap = Com.Fn<UnmapFn>(context, 15);
+            dispatch = Com.Fn<DispatchFn>(context, 41);
+            copyResource = Com.Fn<CopyResourceFn>(context, 47);
+            updateSubresource = Com.Fn<UpdateSubresourceFn>(context, 48);
+            clearUav = Com.Fn<ClearUavUintFn>(context, 51);
+            flush = Com.Fn<ContextFn>(context, 111);
+            removedReason = Com.Fn<GetDeviceRemovedReasonFn>(device, 39);
+
+            shader = CompileShader();
+            reference = CreateBuffer(Threads * 4, 0, BindUnorderedAccess, 0, MiscStructured, 4);
+            referenceView = CreateView(reference, Threads);
+            errors = CreateBuffer(16, 0, BindUnorderedAccess, 0, MiscStructured, 4);
+            errorsView = CreateView(errors, 4);
+            for (int i = 0; i < staging.Length; i++) staging[i] = CreateBuffer(16, UsageStaging, 0, CpuAccessRead, MiscStructured, 4);
+            constants = CreateBuffer(16, 0, BindConstantBuffer, 0, 0, 0);
+
+            Com.Fn<CsSetShaderFn>(context, 69)(context, shader, IntPtr.Zero, 0);
+            Com.Fn<CsSetUavsFn>(context, 68)(context, 0, 2, new IntPtr[] { referenceView, errorsView }, new uint[] { uint.MaxValue, uint.MaxValue });
+            Com.Fn<CsSetConstantBuffersFn>(context, 71)(context, 0, 1, new IntPtr[] { constants });
+        }
+
+        IntPtr CompileShader() {
+            byte[] source = Encoding.ASCII.GetBytes(Shader);
+            IntPtr code, messages;
+            int hr = D3DCompile(source, (UIntPtr)(uint)source.Length, "uv4070", IntPtr.Zero, IntPtr.Zero,
+                "main", "cs_5_0", 1u << 15 /* OPTIMIZATION_LEVEL3 */, 0, out code, out messages);
+            string text = messages != IntPtr.Zero ? Marshal.PtrToStringAnsi(Com.Fn<BlobPointerFn>(messages, 3)(messages)) : "";
+            Com.Release(ref messages);
+            if (hr < 0) throw new InvalidOperationException("No se pudo compilar el test de estrés: " + text);
+            try {
+                IntPtr cs;
+                Com.Check(Com.Fn<CreateComputeShaderFn>(device, 18)(device, Com.Fn<BlobPointerFn>(code, 3)(code),
+                    Com.Fn<BlobSizeFn>(code, 4)(code), IntPtr.Zero, out cs), "CreateComputeShader");
+                return cs;
+            } finally {
+                Com.Release(ref code);
+            }
+        }
+
+        IntPtr CreateBuffer(uint size, uint usage, uint bind, uint cpu, uint misc, uint stride) {
+            BufferDesc d = new BufferDesc();
+            d.ByteWidth = size; d.Usage = usage; d.BindFlags = bind;
+            d.CpuAccessFlags = cpu; d.MiscFlags = misc; d.StructureByteStride = stride;
+            IntPtr buffer;
+            Com.Check(Com.Fn<CreateBufferFn>(device, 3)(device, ref d, IntPtr.Zero, out buffer), "CreateBuffer");
+            return buffer;
+        }
+
+        IntPtr CreateView(IntPtr buffer, uint elements) {
+            UavDesc d = new UavDesc();
+            d.ViewDimension = 1;  // D3D11_UAV_DIMENSION_BUFFER; formato UNKNOWN por ser estructurado
+            d.NumElements = elements;
+            IntPtr view;
+            Com.Check(Com.Fn<CreateUavFn>(device, 8)(device, buffer, ref d, out view), "CreateUnorderedAccessView");
+            return view;
+        }
+
+        protected override void SetParams(uint iterations, uint verify) {
+            updateSubresource(context, constants, 0, IntPtr.Zero, new uint[] { iterations, verify, 0, 0 }, 0, 0);
+        }
+
+        protected override void ClearErrors() {
+            clearUav(context, errorsView, new uint[4]);
+        }
+
+        protected override void Submit(int slot, int perBatch) {
+            for (int i = 0; i < perBatch; i++) dispatch(context, Groups, 1, 1);
+            copyResource(context, staging[slot], errors);
+            flush(context);
+        }
+
+        // Espera a que la GPU termine el lote que copió su contador en staging[slot].
+        protected override bool ReadErrors(int slot, out long count) {
+            count = 0;
+            Mapped m;
+            if (map(context, staging[slot], 0, 1 /* MAP_READ */, 0, out m) < 0) { Lost = true; return false; }
+            count = (uint)Marshal.ReadInt32(m.Data);
+            unmap(context, staging[slot], 0);
+            if (removedReason(device) < 0) { Lost = true; return false; }
+            return true;
+        }
+
+        protected override void ReleaseAll(bool wasLost) {
+            if (context != IntPtr.Zero && !wasLost) Com.Fn<ContextFn>(context, 110)(context);  // ClearState
+            Com.Release(ref constants);
+            for (int i = 0; i < staging.Length; i++) Com.Release(ref staging[i]);
+            Com.Release(ref errorsView);
+            Com.Release(ref errors);
+            Com.Release(ref referenceView);
+            Com.Release(ref reference);
+            Com.Release(ref shader);
+            Com.Release(ref context);
+            Com.Release(ref device);
+        }
+    }
+
+    // Test de ray tracing en DirectX 12 (RayQuery, DXR 1.1): cada hilo lanza rayos
+    // dependientes contra una nube de triángulos y resume los impactos (primitiva y
+    // distancia) en un hash, comparado con la referencia como en el test de cálculo.
+    // Carga los núcleos RT, que consumen con otro patrón que los de cálculo.
+    public sealed class RtStress : Engine {
+        public const uint Groups = 1024;
+        public const uint Threads = Groups * 64;
+        const uint TriangleCount = 32768;
+
+        // HLSL (cs_6_5). El compilador que trae Windows no genera shader model 6, así
+        // que se compila una vez con dxc (tests/build-rt-shader.ps1) y el DXIL va
+        // embebido más abajo. Si cambias el HLSL, vuelve a ejecutar ese script.
+        // RT-HLSL-BEGIN
+        public const string Shader = @"
+#define RS ""RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0), UAV(u1)""
+cbuffer Params : register(b0) { uint Iterations; uint Verify; uint2 Unused; };
+RaytracingAccelerationStructure Scene : register(t0);
+RWStructuredBuffer<uint> Reference : register(u0);
+RWStructuredBuffer<uint> Errors : register(u1);
+
+float Next(inout uint seed)
+{
+    seed = seed * 1664525u + 1013904223u;
+    return (seed >> 8) * (2.0 / 16777216.0) - 1.0;
+}
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    uint seed = id.x * 2654435761u + 12345u;
+    uint h = seed;
+    float3 origin = float3(0, 0, -3);
+    float3 dir = normalize(float3(Next(seed), Next(seed), 2.0));
+    [loop] for (uint i = 0; i < Iterations; i++) {
+        RayDesc ray;
+        ray.Origin = origin;
+        ray.Direction = dir;
+        ray.TMin = 0.001;
+        ray.TMax = 100.0;
+        RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+        q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+        q.Proceed();
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            float t = q.CommittedRayT();
+            h = (h ^ q.CommittedPrimitiveIndex()) * 16777619u;
+            h = (h ^ asuint(t)) * 16777619u;
+            // Rebota en una dirección que depende del impacto: el siguiente rayo
+            // solo es correcto si este lo fue.
+            origin = origin + dir * t;
+            seed ^= h;
+            dir = normalize(float3(Next(seed), Next(seed), Next(seed)));
+        } else {
+            h = (h ^ 0x9e3779b9u) * 16777619u;
+            origin = float3(0, 0, -3);
+            dir = normalize(float3(Next(seed), Next(seed), 2.0));
+        }
+    }
+    if (Verify == 0) Reference[id.x] = h;
+    else if (Reference[id.x] != h) InterlockedAdd(Errors[0], 1);
+}";
+        // RT-HLSL-END
+
+        // RT-DXIL-BEGIN: DXIL del shader en base64 y hash SHA-256 del HLSL con el que se generó
+        const string ShaderHash = "";
+        const string Dxil =
+            "";
+        // RT-DXIL-END
+
+        [StructLayout(LayoutKind.Sequential)] struct QueueDesc { public uint Type; public int Priority; public uint Flags, NodeMask; }
+        [StructLayout(LayoutKind.Sequential)] struct HeapProperties { public uint Type, CpuPageProperty, MemoryPool, CreationNodeMask, VisibleNodeMask; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct ResourceDesc {
+            public uint Dimension, Pad;
+            public ulong Alignment, Width;
+            public uint Height;
+            public ushort DepthOrArraySize, MipLevels;
+            public uint Format, SampleCount, SampleQuality, Layout, Flags;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct ComputePsoDesc {
+            public IntPtr RootSignature, CsPointer;
+            public UIntPtr CsLength;
+            public uint NodeMask, Pad;
+            public IntPtr CachedPointer;
+            public UIntPtr CachedLength;
+            public uint Flags, Pad2;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct Barrier { public uint Type, Flags; public IntPtr Resource; public uint Subresource, Before, After, Pad; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct GeometryDesc {
+            public uint Type, Flags;
+            public ulong Transform;
+            public uint IndexFormat, VertexFormat, IndexCount, VertexCount;
+            public ulong IndexBuffer, VertexAddress, VertexStride;
+        }
+        [StructLayout(LayoutKind.Sequential)] struct BuildInputs { public uint Type, Flags, NumDescs, DescsLayout; public ulong Descs; }
+        [StructLayout(LayoutKind.Sequential)] struct BuildDesc { public ulong Dest; public BuildInputs Inputs; public ulong Source, Scratch; }
+        [StructLayout(LayoutKind.Sequential)] struct PrebuildInfo { public ulong ResultSize, ScratchSize, UpdateScratchSize; }
+        [StructLayout(LayoutKind.Sequential)] struct Options5 { public int SrvOnlyTiledResourceTier3; public uint TiledResourcesTier, RenderPassTier, RaytracingTier; }
+
+        const uint HeapDefault = 1, HeapUpload = 2, HeapReadback = 3;
+        const uint FlagAllowUav = 0x8;
+        const uint StateCommon = 0, StateUav = 0x8, StateCopyDest = 0x400, StateCopySource = 0x800, StateGenericRead = 0xAC3, StateAccelerationStructure = 0x400000;
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateCommandQueueFn(IntPtr self, ref QueueDesc desc, ref Guid riid, out IntPtr queue);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateCommandAllocatorFn(IntPtr self, uint type, ref Guid riid, out IntPtr allocator);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateComputePsoFn(IntPtr self, ref ComputePsoDesc desc, ref Guid riid, out IntPtr pso);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateCommandListFn(IntPtr self, uint node, uint type, IntPtr allocator, IntPtr pso, ref Guid riid, out IntPtr list);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CheckFeatureSupportFn(IntPtr self, uint feature, ref Options5 data, uint size);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateRootSignatureFn(IntPtr self, uint node, IntPtr blob, UIntPtr length, ref Guid riid, out IntPtr signature);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateCommittedResourceFn(IntPtr self, ref HeapProperties heap, uint heapFlags, ref ResourceDesc desc, uint state, IntPtr clear, ref Guid riid, out IntPtr resource);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateFenceFn(IntPtr self, ulong initial, uint flags, ref Guid riid, out IntPtr fence);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int DeviceRemovedReasonFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void GetPrebuildInfoFn(IntPtr self, ref BuildInputs inputs, out PrebuildInfo info);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void ExecuteCommandListsFn(IntPtr self, uint count, IntPtr[] lists);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int QueueSignalFn(IntPtr self, IntPtr fence, ulong value);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int ResetFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate ulong GetCompletedValueFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int SetEventOnCompletionFn(IntPtr self, ulong value, IntPtr handle);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int MapFn(IntPtr self, uint subresource, IntPtr range, out IntPtr data);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void UnmapFn(IntPtr self, uint subresource, IntPtr range);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate ulong GetGpuAddressFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CloseFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int ListResetFn(IntPtr self, IntPtr allocator, IntPtr pso);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void DispatchFn(IntPtr self, uint x, uint y, uint z);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void CopyBufferRegionFn(IntPtr self, IntPtr destination, ulong destinationOffset, IntPtr source, ulong sourceOffset, ulong bytes);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void ResourceBarrierFn(IntPtr self, uint count, ref Barrier barrier);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void SetRootSignatureFn(IntPtr self, IntPtr signature);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void SetRootConstantsFn(IntPtr self, uint index, uint count, uint[] data, uint offset);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void SetRootViewFn(IntPtr self, uint index, ulong address);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void BuildAccelerationStructureFn(IntPtr self, ref BuildDesc desc, uint postbuildCount, IntPtr postbuild);
+
+        [DllImport("d3d12.dll")]
+        static extern int D3D12CreateDevice(IntPtr adapter, uint featureLevel, ref Guid riid, out IntPtr device);
+
+        static Guid IidDevice5 = new Guid("8b4f173b-2fea-4b80-8f58-4307191ab95d");
+        static Guid IidCommandQueue = new Guid("0ec870a6-5d7e-4c22-8cfc-5baae07616ed");
+        static Guid IidCommandAllocator = new Guid("6102dee4-af59-4b09-b999-b44d73f09b24");
+        static Guid IidCommandList4 = new Guid("8754318e-d3a9-4541-98cf-645b50dc4874");
+        static Guid IidFence = new Guid("0a753dcf-c4d8-4b91-adf6-be5a60d95a76");
+        static Guid IidResource = new Guid("696442be-a72e-4059-bc79-5b5c98040fad");
+        static Guid IidRootSignature = new Guid("c54a6b66-72df-4ee8-8be5-a946a1429214");
+        static Guid IidPipelineState = new Guid("765a30f3-f624-4c6f-a828-ace948622445");
+
+        IntPtr device, queue, list, fence, rootSignature, pso;
+        IntPtr reference, errors, zero, vertices, instance, blas, tlas, scratch;
+        readonly IntPtr[] allocators = new IntPtr[2];
+        readonly IntPtr[] readback = new IntPtr[2];
+        readonly ulong[] slotFence = new ulong[2];
+        ulong fenceValue;
+        ulong referenceAddress, errorsAddress, tlasAddress;
+        uint[] parameters = new uint[4];
+
+        ExecuteCommandListsFn execute;
+        QueueSignalFn signal;
+        SetEventOnCompletionFn waitFence;
+        GetCompletedValueFn completedValue;
+        DeviceRemovedReasonFn removedReason;
+        CloseFn close;
+        ListResetFn resetList;
+        DispatchFn dispatch;
+        CopyBufferRegionFn copyRegion;
+        ResourceBarrierFn barrier;
+        SetRootSignatureFn setRootSignature;
+        SetRootConstantsFn setRootConstants;
+        SetRootViewFn setRootSrv, setRootUav;
+
+        public override uint ThreadCount { get { return Threads; } }
+        protected override int Slots { get { return readback.Length; } }
+        protected override double FlopsPerIteration { get { return 0; } }
+        // Un rayo por iteración: se empieza por 1 porque sin núcleos RT (WARP) son muy lentos.
+        protected override uint FirstIterations { get { return 1; } }
+        protected override uint MinIterations { get { return 1; } }
+
+        RtStress() { }
+
+        public static RtStress Open(string adapterName) {
+            RtStress s = new RtStress();
+            try { s.Create(adapterName); } catch { s.Dispose(); throw; }
+            return s;
+        }
+
+        void Create(string adapterName) {
+            if (Dxil.Length == 0) throw new InvalidOperationException("El shader de ray tracing no está embebido en el script (tests/build-rt-shader.ps1 -Embed).");
+            IntPtr adapter = Com.FindAdapter(adapterName);
+            try {
+                Com.Check(D3D12CreateDevice(adapter, 0xb000, ref IidDevice5, out device), "D3D12CreateDevice");
+            } finally {
+                Com.Release(ref adapter);
+            }
+            Options5 options = new Options5();
+            Com.Check(Com.Fn<CheckFeatureSupportFn>(device, 13)(device, 27 /* D3D12_OPTIONS5 */, ref options, 16), "CheckFeatureSupport");
+            if (options.RaytracingTier < 11) throw new InvalidOperationException("Este adaptador no admite ray tracing en línea (DXR 1.1): nivel " + options.RaytracingTier);
+            removedReason = Com.Fn<DeviceRemovedReasonFn>(device, 37);
+
+            QueueDesc qd = new QueueDesc();  // DIRECT, prioridad normal
+            Com.Check(Com.Fn<CreateCommandQueueFn>(device, 8)(device, ref qd, ref IidCommandQueue, out queue), "CreateCommandQueue");
+            execute = Com.Fn<ExecuteCommandListsFn>(queue, 10);
+            signal = Com.Fn<QueueSignalFn>(queue, 14);
+            for (int i = 0; i < allocators.Length; i++) {
+                Com.Check(Com.Fn<CreateCommandAllocatorFn>(device, 9)(device, 0, ref IidCommandAllocator, out allocators[i]), "CreateCommandAllocator");
+            }
+            Com.Check(Com.Fn<CreateFenceFn>(device, 36)(device, 0, 0, ref IidFence, out fence), "CreateFence");
+            completedValue = Com.Fn<GetCompletedValueFn>(fence, 8);
+            waitFence = Com.Fn<SetEventOnCompletionFn>(fence, 9);
+
+            // La firma raíz va dentro del DXIL ([RootSignature] en el HLSL).
+            byte[] dxil = Convert.FromBase64String(Dxil);
+            GCHandle pin = GCHandle.Alloc(dxil, GCHandleType.Pinned);
+            try {
+                Com.Check(Com.Fn<CreateRootSignatureFn>(device, 16)(device, 0, pin.AddrOfPinnedObject(), (UIntPtr)(uint)dxil.Length, ref IidRootSignature, out rootSignature), "CreateRootSignature");
+                ComputePsoDesc pd = new ComputePsoDesc();
+                pd.RootSignature = rootSignature;
+                pd.CsPointer = pin.AddrOfPinnedObject();
+                pd.CsLength = (UIntPtr)(uint)dxil.Length;
+                Com.Check(Com.Fn<CreateComputePsoFn>(device, 11)(device, ref pd, ref IidPipelineState, out pso), "CreateComputePipelineState");
+            } finally {
+                pin.Free();
+            }
+            Com.Check(Com.Fn<CreateCommandListFn>(device, 12)(device, 0, 0, allocators[0], pso, ref IidCommandList4, out list), "CreateCommandList");
+            close = Com.Fn<CloseFn>(list, 9);
+            resetList = Com.Fn<ListResetFn>(list, 10);
+            dispatch = Com.Fn<DispatchFn>(list, 14);
+            copyRegion = Com.Fn<CopyBufferRegionFn>(list, 15);
+            barrier = Com.Fn<ResourceBarrierFn>(list, 26);
+            setRootSignature = Com.Fn<SetRootSignatureFn>(list, 29);
+            setRootConstants = Com.Fn<SetRootConstantsFn>(list, 35);
+            setRootSrv = Com.Fn<SetRootViewFn>(list, 39);
+            setRootUav = Com.Fn<SetRootViewFn>(list, 41);
+            Com.Check(close(list), "Close");
+
+            reference = CreateBuffer(Threads * 4, HeapDefault, FlagAllowUav, StateUav);
+            errors = CreateBuffer(16, HeapDefault, FlagAllowUav, StateUav);
+            zero = CreateBuffer(16, HeapUpload, 0, StateGenericRead);
+            Fill(zero, new byte[16]);
+            for (int i = 0; i < readback.Length; i++) readback[i] = CreateBuffer(16, HeapReadback, 0, StateCopyDest);
+            referenceAddress = Com.Fn<GetGpuAddressFn>(reference, 11)(reference);
+            errorsAddress = Com.Fn<GetGpuAddressFn>(errors, 11)(errors);
+            BuildScene();
+        }
+
+        IntPtr CreateBuffer(ulong size, uint heapType, uint flags, uint state) {
+            HeapProperties heap = new HeapProperties();
+            heap.Type = heapType; heap.CreationNodeMask = 1; heap.VisibleNodeMask = 1;
+            ResourceDesc d = new ResourceDesc();
+            d.Dimension = 1;  // BUFFER
+            d.Width = size; d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1;
+            d.SampleCount = 1; d.Layout = 1 /* ROW_MAJOR */; d.Flags = flags;
+            IntPtr resource;
+            Com.Check(Com.Fn<CreateCommittedResourceFn>(device, 27)(device, ref heap, 0, ref d, state, IntPtr.Zero, ref IidResource, out resource), "CreateCommittedResource");
+            return resource;
+        }
+
+        void Fill(IntPtr resource, byte[] data) {
+            IntPtr p;
+            Com.Check(Com.Fn<MapFn>(resource, 8)(resource, 0, IntPtr.Zero, out p), "Map");
+            Marshal.Copy(data, 0, p, data.Length);
+            Com.Fn<UnmapFn>(resource, 9)(resource, 0, IntPtr.Zero);
+        }
+
+        // Una nube de triángulos pequeños, siempre la misma, delante del origen de los rayos.
+        void BuildScene() {
+            float[] v = new float[TriangleCount * 9];
+            uint seed = 7;
+            for (int i = 0; i < v.Length; i += 9) {
+                float[] c = new float[3];
+                for (int k = 0; k < 3; k++) { seed = seed * 1664525u + 1013904223u; c[k] = (seed >> 8) * (4.0f / 16777216.0f) - 2.0f; }
+                c[2] += 1.0f;  // z en [-1, 3]
+                for (int k = 0; k < 9; k++) { seed = seed * 1664525u + 1013904223u; v[i + k] = c[k % 3] + (seed >> 8) * (0.3f / 16777216.0f) - 0.15f; }
+            }
+            byte[] bytes = new byte[v.Length * 4];
+            Buffer.BlockCopy(v, 0, bytes, 0, bytes.Length);
+            vertices = CreateBuffer((ulong)bytes.Length, HeapUpload, 0, StateGenericRead);
+            Fill(vertices, bytes);
+
+            GeometryDesc geometry = new GeometryDesc();
+            geometry.Flags = 1;         // OPAQUE
+            geometry.VertexFormat = 6;  // R32G32B32_FLOAT
+            geometry.VertexCount = TriangleCount * 3;
+            geometry.VertexAddress = Com.Fn<GetGpuAddressFn>(vertices, 11)(vertices);
+            geometry.VertexStride = 12;
+            GCHandle pin = GCHandle.Alloc(geometry, GCHandleType.Pinned);
+            try {
+                BuildInputs blasInputs = new BuildInputs();
+                blasInputs.Type = 1;  // BOTTOM_LEVEL
+                blasInputs.NumDescs = 1;
+                blasInputs.Descs = (ulong)pin.AddrOfPinnedObject().ToInt64();
+                PrebuildInfo blasInfo;
+                GetPrebuildInfoFn prebuild = Com.Fn<GetPrebuildInfoFn>(device, 63);
+                prebuild(device, ref blasInputs, out blasInfo);
+                blas = CreateBuffer(blasInfo.ResultSize, HeapDefault, FlagAllowUav, StateAccelerationStructure);
+                ulong blasAddress = Com.Fn<GetGpuAddressFn>(blas, 11)(blas);
+
+                // Una instancia con la transformación identidad y máscara 0xFF.
+                byte[] inst = new byte[64];
+                Buffer.BlockCopy(new float[] { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 }, 0, inst, 0, 48);
+                Buffer.BlockCopy(BitConverter.GetBytes(0xFF000000u), 0, inst, 48, 4);
+                Buffer.BlockCopy(BitConverter.GetBytes(blasAddress), 0, inst, 56, 8);
+                instance = CreateBuffer(64, HeapUpload, 0, StateGenericRead);
+                Fill(instance, inst);
+                BuildInputs tlasInputs = new BuildInputs();
+                tlasInputs.NumDescs = 1;  // TOP_LEVEL
+                tlasInputs.Descs = Com.Fn<GetGpuAddressFn>(instance, 11)(instance);
+                PrebuildInfo tlasInfo;
+                prebuild(device, ref tlasInputs, out tlasInfo);
+                tlas = CreateBuffer(tlasInfo.ResultSize, HeapDefault, FlagAllowUav, StateAccelerationStructure);
+                tlasAddress = Com.Fn<GetGpuAddressFn>(tlas, 11)(tlas);
+                scratch = CreateBuffer(Math.Max(blasInfo.ScratchSize, tlasInfo.ScratchSize), HeapDefault, FlagAllowUav, StateUav);
+                ulong scratchAddress = Com.Fn<GetGpuAddressFn>(scratch, 11)(scratch);
+
+                Begin(0);
+                BuildDesc build = new BuildDesc();
+                build.Dest = blasAddress; build.Inputs = blasInputs; build.Scratch = scratchAddress;
+                Com.Fn<BuildAccelerationStructureFn>(list, 72)(list, ref build, 0, IntPtr.Zero);
+                UavBarrier(blas);
+                build.Dest = tlasAddress; build.Inputs = tlasInputs;
+                Com.Fn<BuildAccelerationStructureFn>(list, 72)(list, ref build, 0, IntPtr.Zero);
+                UavBarrier(tlas);
+                End(0);
+                Wait(slotFence[0]);
+                if (removedReason(device) < 0) throw new InvalidOperationException("El driver se ha reiniciado al construir la escena de ray tracing.");
+            } finally {
+                pin.Free();
+            }
+        }
+
+        void Begin(int slot) {
+            Wait(slotFence[slot]);
+            Com.Check(Com.Fn<ResetFn>(allocators[slot], 8)(allocators[slot]), "CommandAllocator.Reset");
+            Com.Check(resetList(list, allocators[slot], pso), "CommandList.Reset");
+        }
+
+        void End(int slot) {
+            Com.Check(close(list), "Close");
+            execute(queue, 1, new IntPtr[] { list });
+            fenceValue++;
+            Com.Check(signal(queue, fence, fenceValue), "Signal");
+            slotFence[slot] = fenceValue;
+        }
+
+        void Wait(ulong value) {
+            if (completedValue(fence) < value) Com.Check(waitFence(fence, value, IntPtr.Zero), "SetEventOnCompletion");
+        }
+
+        void UavBarrier(IntPtr resource) {
+            Barrier b = new Barrier();
+            b.Type = 2;  // UAV
+            b.Resource = resource;
+            barrier(list, 1, ref b);
+        }
+
+        void Transition(IntPtr resource, uint before, uint after) {
+            Barrier b = new Barrier();
+            b.Resource = resource; b.Subresource = 0xffffffff; b.Before = before; b.After = after;
+            barrier(list, 1, ref b);
+        }
+
+        protected override void SetParams(uint iterations, uint verify) {
+            parameters = new uint[] { iterations, verify, 0, 0 };
+        }
+
+        protected override void ClearErrors() {
+            if (Lost) return;
+            Begin(0);
+            Transition(errors, StateUav, StateCopyDest);
+            copyRegion(list, errors, 0, zero, 0, 16);
+            Transition(errors, StateCopyDest, StateUav);
+            End(0);
+            Wait(slotFence[0]);
+        }
+
+        protected override void Submit(int slot, int perBatch) {
+            if (Lost) return;
+            Begin(slot);
+            setRootSignature(list, rootSignature);
+            setRootConstants(list, 0, 4, parameters, 0);
+            setRootSrv(list, 1, tlasAddress);
+            setRootUav(list, 2, referenceAddress);
+            setRootUav(list, 3, errorsAddress);
+            for (int i = 0; i < perBatch; i++) {
+                UavBarrier(errors);
+                UavBarrier(reference);
+                dispatch(list, Groups, 1, 1);
+            }
+            Transition(errors, StateUav, StateCopySource);
+            copyRegion(list, readback[slot], 0, errors, 0, 16);
+            Transition(errors, StateCopySource, StateUav);
+            End(slot);
+        }
+
+        protected override bool ReadErrors(int slot, out long count) {
+            count = 0;
+            if (Lost) return false;
+            Wait(slotFence[slot]);
+            if (removedReason(device) < 0) { Lost = true; return false; }
+            IntPtr p;
+            if (Com.Fn<MapFn>(readback[slot], 8)(readback[slot], 0, IntPtr.Zero, out p) < 0) { Lost = true; return false; }
+            count = (uint)Marshal.ReadInt32(p);
+            Com.Fn<UnmapFn>(readback[slot], 9)(readback[slot], 0, IntPtr.Zero);
+            return true;
+        }
+
+        protected override void ReleaseAll(bool wasLost) {
+            if (!wasLost && queue != IntPtr.Zero && fence != IntPtr.Zero) {
+                try { Wait(fenceValue); } catch (InvalidOperationException) { }
+            }
+            Com.Release(ref scratch);
+            Com.Release(ref tlas);
+            Com.Release(ref blas);
+            Com.Release(ref instance);
+            Com.Release(ref vertices);
+            for (int i = 0; i < readback.Length; i++) Com.Release(ref readback[i]);
+            Com.Release(ref zero);
+            Com.Release(ref errors);
+            Com.Release(ref reference);
+            Com.Release(ref list);
+            Com.Release(ref pso);
+            Com.Release(ref rootSignature);
+            Com.Release(ref fence);
+            for (int i = 0; i < allocators.Length; i++) Com.Release(ref allocators[i]);
+            Com.Release(ref queue);
+            Com.Release(ref device);
         }
     }
 }
@@ -957,27 +1428,49 @@ function Resolve-Config([bool]$Required) {
 # Test de estrés y ajuste automático
 
 $script:Engine = $null
+$script:RtEngine = $null
+$RtMode = 3   # modo de Invoke-Step: el test de ray tracing (carga sostenida)
 
 function New-StressEngine { [Uv4070.Stress]::Open($GpuName) }
+function New-RtStressEngine { [Uv4070.RtStress]::Open($GpuName) }
 
 # Motor del test listo para usar. Al crearlo, la referencia se calcula a
 # $SafeMHz y sin offset, donde cualquier 4070 es estable; después hay que volver
 # a poner la configuración que se quiera probar.
 function Get-Engine($Device) {
     if ($script:Engine -and -not $script:Engine.Lost) { return $script:Engine }
-    Close-Engine
+    if ($script:Engine) { $script:Engine.Dispose(); $script:Engine = $null }
+    $script:Engine = New-Engine $Device 'compute' { New-StressEngine }
+    $script:Engine
+}
+
+# El test de ray tracing, con su propia referencia.
+function Get-RtEngine($Device) {
+    if ($script:RtEngine -and -not $script:RtEngine.Lost) { return $script:RtEngine }
+    if ($script:RtEngine) { $script:RtEngine.Dispose(); $script:RtEngine = $null }
+    $script:RtEngine = New-Engine $Device 'raytracing' { New-RtStressEngine }
+    $script:RtEngine
+}
+
+function New-Engine($Device, [string]$Kind, [scriptblock]$Open) {
     Set-Uv $Device $SafeMHz 0
-    $engine = New-StressEngine
-    $engine.Calibrate(15)
-    $engine.CaptureReference()
-    Write-Log 'engine' @{ iterations = $engine.Iterations; dispatchMs = [math]::Round($engine.DispatchMs, 2) }
-    $script:Engine = $engine
+    $engine = & $Open
+    try {
+        $engine.Calibrate(15)
+        $engine.CaptureReference()
+    } catch {
+        $engine.Dispose()
+        throw
+    }
+    Write-Log 'engine' @{ kind = $Kind; iterations = $engine.Iterations; dispatchMs = [math]::Round($engine.DispatchMs, 2) }
     $engine
 }
 
 function Close-Engine {
     if ($script:Engine) { $script:Engine.Dispose() }
+    if ($script:RtEngine) { $script:RtEngine.Dispose() }
     $script:Engine = $null
+    $script:RtEngine = $null
 }
 
 # Reinicios del driver (TDR) en el registro de eventos de Windows desde $Since.
@@ -1007,22 +1500,23 @@ function Search-DriverResets([datetime]$Since) {
 }
 
 # Una carga con un tope y offset concretos ($Cap 0 = de serie). $Mode es
-# Steady, Pulses o Light de [Uv4070.Stress]. En tramos de 20 s como máximo para
-# que Ctrl+C responda.
+# Steady, Pulses o Light de [Uv4070.Stress], o $RtMode (ray tracing). En tramos
+# de 20 s como máximo para que Ctrl+C responda.
 function Invoke-Step($Device, [int]$Cap, [int]$Offset, [double]$Seconds, [int]$Mode = 0) {
-    $engine = Get-Engine $Device
+    $runMode = $Mode
+    if ($Mode -eq $RtMode) { $engine = Get-RtEngine $Device; $runMode = [Uv4070.Stress]::Steady } else { $engine = Get-Engine $Device }
     if ($Cap -gt 0) { Set-Uv $Device $Cap $Offset } else { [void](Reset-Stock $Device) }
     $since = Get-Date
     $left = $Seconds * $TestScale
     do {
         $chunk = [math]::Min($left, 20)
         $left -= $chunk
-        $result = $engine.Run($chunk, $Device, $Mode)
+        $result = $engine.Run($chunk, $Device, $runMode)
     } while (-not $result.Failure -and $left -gt 0)
     $resets = @(Get-DriverResets $since).Count
     if (-not $result.Failure -and $resets -gt 0) { $result.Failure = 'el driver se ha reiniciado' }
     Write-Log 'load' @{
-        cap = $Cap; offset = $Offset; seconds = $Seconds * $TestScale; mode = @('steady', 'pulses', 'light')[$Mode]
+        cap = $Cap; offset = $Offset; seconds = $Seconds * $TestScale; mode = @('steady', 'pulses', 'light', 'rt')[$Mode]
         driverResets = $resets; result = (ConvertTo-LogResult $result)
     }
     $result
@@ -1055,7 +1549,9 @@ function Get-TargetCap([double]$BoostMHz, [int]$LossPct) {
 }
 
 # Un ciclo de estabilidad: carga sostenida en el tope, la misma curva más abajo
-# (cada reloj usa su propio punto de tensión) y pulsos de carga. $Scale alarga cada parte.
+# (cada reloj usa su propio punto de tensión), carga ligera en el tope (con la
+# carga máxima la GPU se queda en el límite de potencia y no llega al tope; con
+# la ligera sí, como en un juego), ray tracing y pulsos de carga. $Scale alarga cada parte.
 function Get-StabilityPlan([int]$Cap) {
     $steadyMode = [Uv4070.Stress]::Steady
     $plan = @(@{ Cap = $Cap; Seconds = 40; Mode = $steadyMode })
@@ -1063,12 +1559,14 @@ function Get-StabilityPlan([int]$Cap) {
         foreach ($f in ($Cap - 300), ($Cap - 600), ($Cap - 900)) {
             if ($f -ge $SafeMHz) { $plan += @{ Cap = $f; Seconds = 8; Mode = $steadyMode } }
         }
+        $plan += @{ Cap = $Cap; Seconds = 10; Mode = [Uv4070.Stress]::Light }
+        $plan += @{ Cap = $Cap; Seconds = 12; Mode = $RtMode }
     }
     $plan += @{ Cap = $Cap; Seconds = 15; Mode = [Uv4070.Stress]::Pulses }
     $plan
 }
 
-# Segundos de un ciclo con $Scale = 1: unos 80 con tope y 55 de serie.
+# Segundos de un ciclo con $Scale = 1: unos 100 con tope y 55 de serie.
 function Get-StabilityCycleSeconds([int]$Cap) {
     [int]((Get-StabilityPlan $Cap | ForEach-Object { $_.Seconds } | Measure-Object -Sum).Sum)
 }
@@ -1080,7 +1578,8 @@ function Test-Stability($Device, [int]$Cap, [int]$Offset, [double]$Scale) {
         if ($null -eq $steady) { $steady = $r }
         if ($r.Failure) {
             $where = if ($p.Cap -gt 0) { " a $($p.Cap) MHz" } else { '' }
-            return [pscustomobject]@{ Failure = "$($r.Failure)$where"; Steady = $steady }
+            $how = @('', ' en pulsos', ' con carga ligera', ' con ray tracing')[$p.Mode]
+            return [pscustomobject]@{ Failure = "$($r.Failure)$where$how"; Steady = $steady }
         }
     }
     [pscustomobject]@{ Failure = $null; Steady = $steady }
@@ -1137,7 +1636,7 @@ function Format-Point($P) {
 }
 
 function Invoke-Tune($Device) {
-    Write-Host "tune busca la configuración que menos consume perdiendo como mucho un $MaxLossPct % de reloj (unos 25 minutos):"
+    Write-Host "tune busca la configuración que menos consume perdiendo como mucho un $MaxLossPct % de reloj (unos 30 minutos):"
     Write-Host '  1. Mide la tarjeta de serie: rendimiento, consumo y reloj máximo.'
     Write-Host "  2. Con el tope un $MaxLossPct % por debajo de ese reloj, sube la curva (menos tensión) hasta que"
     Write-Host "     el test de estrés falla, y deja $MarginMHz MHz de margen."
@@ -1603,6 +2102,29 @@ function Invoke-SelfTest($Device) {
             $good = $engine.Run(1, $Device, [Uv4070.Stress]::Steady)
             $detects = $bad.Errors -gt 0 -and -not $good.Failure
             & $add 'deteccion-errores' $(if ($detects) { 'ok' } else { 'fail' }) ('fallo simulado: {0} hilos erróneos; después: {1}' -f $bad.Errors, $(if ($good.Failure) { $good.Failure } else { 'sin errores' })) @{
+                simulated = (ConvertTo-LogResult $bad); after = (ConvertTo-LogResult $good)
+            }
+        }
+
+        # Test de ray tracing (DirectX 12, DXR 1.1).
+        $rt = $null
+        try {
+            $rt = Get-RtEngine $Device
+            & $add 'raytracing' 'ok' ('{0} rayos por hilo, {1:N1} ms por dispatch' -f $rt.Iterations, $rt.DispatchMs) @{ iterations = $rt.Iterations; dispatchMs = $rt.DispatchMs }
+        } catch {
+            $e = $_.Exception
+            while ($e.InnerException) { $e = $e.InnerException }
+            & $add 'raytracing' 'fail' $e.Message $null
+        }
+        if ($rt) {
+            $r = Invoke-Step $Device $SafeMHz 0 4 $RtMode
+            & $add 'carga-rt' $(if ($r.Failure) { 'fail' } else { 'ok' }) $(if ($r.Failure) { $r.Failure } else { 'con tope {0} MHz: {1:N0} MHz, {2:N0} W, sin errores' -f $SafeMHz, $r.ClockMHz, $r.Watts }) (ConvertTo-LogResult $r)
+            $rt.Iterations += 1
+            $bad = $rt.Run(1, $Device, [Uv4070.Stress]::Steady)
+            $rt.Iterations -= 1
+            $good = $rt.Run(1, $Device, [Uv4070.Stress]::Steady)
+            $detects = $bad.Errors -gt 0 -and -not $good.Failure
+            & $add 'deteccion-rt' $(if ($detects) { 'ok' } else { 'fail' }) ('fallo simulado: {0} hilos erróneos; después: {1}' -f $bad.Errors, $(if ($good.Failure) { $good.Failure } else { 'sin errores' })) @{
                 simulated = (ConvertTo-LogResult $bad); after = (ConvertTo-LogResult $good)
             }
         }
