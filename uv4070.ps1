@@ -640,8 +640,11 @@ void main(uint3 id : SV_DispatchThreadID)
             return true;
         }
 
+        // Después de Dispose el motor cuenta como perdido: Run devuelve un fallo en vez de
+        // usar punteros ya liberados.
         public void Dispose() {
             if (context != IntPtr.Zero && !Lost) Fn<ContextFn>(context, 110)(context);  // ClearState
+            Lost = true;
             Release(ref constants);
             for (int i = 0; i < staging.Length; i++) Release(ref staging[i]);
             Release(ref errorsView);
