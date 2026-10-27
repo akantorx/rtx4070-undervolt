@@ -114,13 +114,13 @@ Check 'tune: informe guardado y con comparación' ((Get-Content (Join-Path (Get-
 Check 'tune: borra el estado y lo instala con -Yes' (-not (Test-Path (Join-Path (Get-DataDir) 'tune-state.json')) -and $script:Installs -eq 1)
 $summary = Get-Content (Join-Path (Get-DataDir) 'tune-report.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Check 'tune: tune-report.json con la configuración y la búsqueda' ($summary.config.MaxMHz -eq 2715 -and $summary.highestStableOffset -eq 165 -and @($summary.failed) -contains 180 -and $summary.stock.Watts -gt $summary.final.Watts -and $summary.stockCold.Watts -eq $summary.stock.Watts) ($summary | ConvertTo-Json -Compress -Depth 4)
-$steps = @($events | Where-Object { $_.event -eq 'tune-step' })
-Check 'registro: cada paso lleva si la GPU estaba al límite de potencia' (@($steps | Where-Object { $null -ne $_.powerCappedPct }).Count -eq $steps.Count) ($steps | ConvertTo-Json -Compress)
 $events = @(Get-Content -LiteralPath $script:LogPath -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
 $names = @($events | ForEach-Object { $_.event })
 Check 'registro: cada línea es JSON y lleva las decisiones de tune' (@($names | Where-Object { $_ -eq 'tune-step' }).Count -eq 7 -and
     $names -contains 'tune-baseline' -and $names -contains 'tune-best' -and $names -contains 'tune-confirm' -and $names -contains 'tune-result' -and
     $names -contains 'load' -and $names -contains 'nvml' -and $names -contains 'engine') ($names -join ',')
+$steps = @($events | Where-Object { $_.event -eq 'tune-step' })
+Check 'registro: cada paso lleva si la GPU estaba al límite de potencia' (@($steps | Where-Object { $null -ne $_.powerCappedPct }).Count -eq $steps.Count) ($steps | ConvertTo-Json -Compress)
 $failedStep = @($events | Where-Object { $_.event -eq 'tune-step' -and $_.offset -eq 180 })
 Check 'registro: el paso que falla lleva el motivo y el consumo' ($failedStep.Count -eq 1 -and $failedStep[0].failure -match 'errores de cálculo a 2715 MHz') ($failedStep | ConvertTo-Json -Compress)
 $load = @($events | Where-Object { $_.event -eq 'load' })[0]
