@@ -1,26 +1,11 @@
 # uv4070
 
-Undervolt para **una NVIDIA GeForce RTX 4070** en Windows, en un solo script de PowerShell.
-Sin MSI Afterburner, sin programa en segundo plano, sin base de datos de juegos.
+Undervolt automático para **una NVIDIA GeForce RTX 4070** en Windows, en un solo script de PowerShell.
+Sin MSI Afterburner, sin programa en segundo plano, sin perfiles.
 
-Es lo mismo que hacen NV-UV o Afterburner con su "Voltage Lock" o curva aplanada, pero reducido a lo
-único que hace falta para una sola tarjeta:
-
-1. **Tope de reloj** (`-MaxMHz`): la GPU nunca pasa de esa frecuencia.
-2. **Offset de curva** (`-OffsetMHz`): toda la curva tensión/frecuencia sube esos MHz.
-
-Con la curva subida, la GPU llega al tope con menos tensión que de serie y ahí se queda. Es justo el
-método clásico de Afterburner: subir la curva y aplanarla a partir de un punto. Se hace con
-**NVML** (`nvml.dll`), la librería oficial que instala el driver de NVIDIA.
-
-## Requisitos
-
-- Windows 10 u 11 de 64 bits.
-- RTX 4070 de sobremesa. El script se niega a funcionar con cualquier otra GPU, incluidas la 4070 Super, la Ti y la de portátil.
-- Driver de NVIDIA reciente (R555 o posterior recomendado).
-- PowerShell **como administrador** para `apply`, `reset`, `install` y `uninstall`.
-- **No lo uses a la vez que** MSI Afterburner, NV-UV o NV-UV Play: todos tocan los mismos ajustes.
-  Ponlos en valores por defecto y quítalos del arranque, o desinstálalos.
+Ejecutas `tune` una vez (unos 25 minutos) y te deja **una configuración para todo**: la que menos
+consume perdiendo como mucho un 3 % de reloj respecto a serie. Antes de guardarla, la valida con su
+propio test de estrés.
 
 ## Uso
 
@@ -28,74 +13,122 @@ Descarga `uv4070.ps1` y `uv4070.cmd` en la misma carpeta, abre **Terminal (Admin
 carpeta y ejecuta:
 
 ```powershell
-.\uv4070.cmd                 # estado (también con doble clic)
-.\uv4070.cmd apply           # preset balanced: tope 2610 MHz, offset +120 MHz
-.\uv4070.cmd monitor         # reloj, consumo, temperatura cada segundo
-.\uv4070.cmd reset           # valores de fábrica
+.\uv4070.cmd tune
 ```
 
-El `.cmd` solo evita tener que cambiar la ExecutionPolicy. También vale
-`powershell -ExecutionPolicy Bypass -File .\uv4070.ps1 apply`.
+Cierra antes los juegos, el navegador y todo lo que use la GPU. Al terminar, `tune` muestra una tabla
+que compara la tarjeta de serie con la configuración nueva: reloj máximo, rendimiento, 1 % low, consumo,
+temperatura y eficiencia. Después pregunta si quieres aplicarla siempre al iniciar Windows. Con eso ya
+está. El informe queda guardado en `C:\Program Files\uv4070\tune-report.txt`.
 
-| Preset        | Tope     |
-|---------------|----------|
-| `eco`         | 2400 MHz |
-| `balanced`    | 2610 MHz |
-| `performance` | 2745 MHz |
+## Qué hace `tune`
 
-Como referencia, una 4070 de serie suele subir a unos 2700-2800 MHz en juegos. El preset solo elige
-el tope. El offset depende de tu chip concreto y se ajusta aparte:
+El undervolt se consigue con dos ajustes que el driver aplica a través de NVML (`nvml.dll`, la librería
+oficial de NVIDIA): un **tope de reloj** y un **offset** que sube toda la curva tensión/frecuencia. Con la
+curva subida, la GPU llega al tope con menos tensión que de serie y ya no sube más. Es el mismo método
+que "subir la curva y aplanarla" en Afterburner.
+
+1. **Mide la tarjeta de serie**: rendimiento, consumo y 1 % low con carga máxima, y el reloj máximo con
+   una carga ligera, como la de un juego que no llega al límite de potencia.
+2. **Fija el tope** un 3 % por debajo de ese reloj máximo y **sube el offset**, es decir, baja la
+   tensión, de 30 en 30 MHz. Cada paso pasa el test de estrés completo. Al primer fallo afina en pasos de 15 y deja
+   **30 MHz de margen** bajo el último valor estable. Si en algún momento más offset ya no reduce el
+   consumo (la tensión ya está en el mínimo de la curva), se detiene sin arriesgar más.
+3. **Confirma** el resultado con unos 10 minutos más de estrés. Si falla, baja 15 MHz y vuelve a confirmar.
+
+¿Por qué así? La parte alta de la curva es donde la 4070 gasta más tensión para muy poco reloj. Renunciar
+a ese 3 % y quitarle a la vez la tensión que tu chip no necesita es lo que más reduce el consumo. Además,
+el reloj deja de rebotar contra el límite de potencia, y eso mejora los 1 % low.
+
+Si prefieres ahorrar más a cambio de algo más de rendimiento: `.\uv4070.cmd tune -MaxLossPct 6`
+(de 0 a 15).
+
+Si el PC llega a colgarse durante la búsqueda, reinícialo y vuelve a ejecutar `tune`: sigue donde lo
+dejó y cuenta ese paso como inestable.
+
+## El test de estrés
+
+Va incluido en el script y no necesita nada aparte. Es un compute shader de DirectX 11 que pone a
+trabajar todas las unidades FP32 de la GPU:
+
+- Cada hilo calcula 8 cadenas caóticas (`x = x·x + c`, una FMA por paso) y resume el recorrido en un hash.
+  Como son caóticas, un error de cálculo de la GPU cambia el resultado final, y se compara con una
+  referencia calculada a 1500 MHz y sin offset, donde cualquier 4070 es estable. Así detecta la
+  inestabilidad **antes** de que el driver llegue a colgarse.
+- No solo prueba el tope: también 300, 600 y 900 MHz por debajo, porque el offset desplaza toda la curva
+  y cada reloj usa su propio punto de tensión. Y añade pulsos de carga y reposo, que es donde muchos
+  undervolts fallan, en los cambios bruscos de tensión.
+- Cuenta como fallo cualquier reinicio del driver (TDR), tanto si lo nota DirectX como si aparece en el
+  registro de eventos de Windows.
+
+Para probar tu configuración cuando quieras, por ejemplo tras actualizar el driver:
 
 ```powershell
-.\uv4070.cmd apply -Preset eco
-.\uv4070.cmd apply -MaxMHz 2700 -OffsetMHz 150
-.\uv4070.cmd apply -PowerPct 85        # además, límite de potencia al 85 % del de fábrica
+.\uv4070.cmd stress              # 10 minutos
+.\uv4070.cmd stress -Minutes 60
 ```
 
-## Cómo afinarlo
+## Otros comandos
 
-1. `apply` con los valores por defecto (+120 MHz).
-2. Juega a lo más exigente que tengas, o deja en bucle una prueba de estrés (3DMark Speed Way o Port Royal) durante
-   20-30 minutos. En otra ventana, `monitor` te muestra que el reloj se queda en el tope y que el consumo baja.
-   La tensión no la da NVML: para verla usa HWiNFO o GPU-Z.
-3. Si es estable, sube el offset 15 MHz (`-OffsetMHz 135`, `150`...) y repite.
-4. Si un juego se cierra, aparecen artefactos o el driver se reinicia, vuelve al último valor estable.
-   Una inestabilidad por undervolt no daña la tarjeta: como mucho cuelga el juego o el driver.
-5. Cuando lo tengas, déjalo fijo:
+| Comando | Qué hace |
+|---|---|
+| `status` | Estado actual, configuración guardada y si se aplica al iniciar (también con doble clic en `uv4070.cmd`). |
+| `monitor` | Reloj, consumo, temperatura y qué limita a la GPU, cada segundo. |
+| `apply` | Aplica la configuración guardada. Con `-MaxMHz` y `-OffsetMHz`, una manual. Con `-PowerPct`, además un límite de potencia. |
+| `install` | Aplica la configuración en cada inicio de sesión y al volver de suspensión, con una tarea programada. |
+| `uninstall` | Quita la tarea y vuelve a valores de fábrica (la configuración guardada se conserva). |
+| `reset` | Vuelve a valores de fábrica hasta el próximo `apply` o reinicio. |
 
-```powershell
-.\uv4070.cmd install -MaxMHz 2610 -OffsetMHz 150
-```
+Todo se guarda en `C:\Program Files\uv4070`: la copia del script que usa la tarea, `config.json`, el
+informe y el registro. Solo un administrador puede modificar esa carpeta.
 
-`install` aplica los ajustes ahora, copia el script a `C:\Program Files\uv4070` y crea una tarea
-programada (`uv4070`) que los vuelve a aplicar en cada inicio de sesión y al volver de suspensión. Lo
-que hizo la última vez queda en `C:\ProgramData\uv4070\uv4070.log`. Para quitarlo todo usa `.\uv4070.cmd uninstall`.
+## Requisitos
 
-Los ajustes viven en el driver, no en la tarjeta: al reiniciar sin la tarea instalada, o al
-reinstalar el driver, todo vuelve a fábrica.
+- Windows 10 u 11 de 64 bits, con el PowerShell que trae Windows (5.1) o PowerShell 7.
+- RTX 4070 de sobremesa. El script se niega a funcionar con cualquier otra GPU, incluidas la 4070 Super,
+  la Ti y la de portátil.
+- Driver de NVIDIA reciente (R555 o posterior recomendado).
+- Terminal **como administrador** para todo salvo `status` y `monitor`.
+- **No lo uses a la vez que** MSI Afterburner, NV-UV o NV-UV Play: tocan los mismos ajustes. Ponlos en
+  valores por defecto y quítalos del arranque, o desinstálalos.
 
 ## Medidas de seguridad
 
-- Nunca deja un offset positivo sin tope, porque eso sería un overclock: primero pone el tope y después el offset.
-  `reset` lo hace en orden inverso, y si no consigue bajar el offset a 0, deja el tope puesto.
-- Si falla cualquier paso de `apply`, vuelve a valores de fábrica y muestra el error de NVML.
-- Comprueba que el driver ha aplicado el offset pedido.
-- Límites fijos: tope de 1500 a 2850 MHz, offset de 0 a +300 MHz y potencia del 50 al 100 %. Nunca sube el límite de potencia.
+- Un undervolt inestable no daña la tarjeta: como mucho cuelga el juego o reinicia el driver. Nunca se
+  sube la tensión ni el límite de potencia.
+- Nunca deja un offset positivo sin tope, porque eso sería un overclock: pone primero el tope y después
+  el offset. `reset` lo hace en orden inverso, y si no consigue bajar el offset a 0, deja el tope puesto.
+- Si falla cualquier paso, vuelve a valores de fábrica. Al cancelar `tune` con Ctrl+C, también.
+- Comprueba que el driver aplica de verdad el offset pedido.
+- Límites fijos: tope de 1500 a 3000 MHz, offset de 0 a +300 MHz y potencia del 50 al 100 %.
 
 ## Limitaciones
 
-- Lo he escrito sin acceso a una RTX 4070 real. La lógica (orden de escrituras, rollback, detección de la
-  GPU, compatibilidad con drivers antiguos) está probada con un NVML simulado (`tests/`), pero no con el driver de
-  verdad. La primera vez, usa `apply` a mano y compruébalo con `monitor` y HWiNFO antes de usar `install`.
-- NVML no permite leer el tope activo: `status` muestra el offset, y el tope se ve en `monitor` con la GPU en carga.
-- No incluye control de ventiladores, overclock de memoria, perfiles por juego, overlay ni escáner de estabilidad.
+- **Lo he escrito sin acceso a una RTX 4070.** Lo verificado:
+  - La lógica (orden de escrituras, búsqueda, margen, reanudación, rollback) contra un NVML y una 4070
+    simulados (`tests/run.sh`).
+  - El test de estrés DirectX 11 ejecutándose de verdad, con el compilador de shaders de Microsoft,
+    bajo Wine y su D3D11 por software (`tests/stress-wine.sh`).
+  - Que el código C# compila como C# 5, el que admite el PowerShell de Windows.
+
+  Lo que solo se verá en tu PC: cómo responde el driver real, si la carga llega a P0 (`tune` lo
+  comprueba y se niega si no) y las cifras de consumo y reloj. Si algo falla, el script vuelve a fábrica y
+  muestra el error.
+- El test de estrés carga los núcleos de cálculo, que es lo que limita un undervolt, pero no los de
+  ray tracing ni los tensor. Tras `tune`, juega a algo exigente con RT. Si un juego se cierra o el driver
+  se reinicia, baja el offset 15 MHz (`.\uv4070.cmd install -OffsetMHz <valor - 15>`).
+- El rendimiento que mide es el de su propia carga. En juegos, la pérdida de reloj del 3 % suele notarse
+  menos en FPS.
+- NVML no permite leer la tensión ni el tope activo: para ver la tensión usa HWiNFO o GPU-Z.
+- No incluye control de ventiladores, overclock de memoria ni perfiles por juego.
 
 ## Pruebas
 
-En Linux, con `gcc` y PowerShell 7:
+En Linux, con `gcc` y PowerShell 7 (y `mcs` de Mono para la comprobación de C# 5):
 
 ```bash
-tests/run.sh            # PWSH=/ruta/a/pwsh si no está en el PATH
+tests/run.sh                       # PWSH=/ruta/a/pwsh si no está en el PATH
+D3DCOMPILER=... tests/stress-wine.sh   # test de estrés bajo Wine; requisitos dentro del script
 ```
 
 ## Créditos
@@ -103,4 +136,5 @@ tests/run.sh            # PWSH=/ruta/a/pwsh si no está en el PATH
 La forma de usar NVML para el offset (API moderna `nvmlDeviceSetClockOffsets` en P0, con
 `nvmlDeviceSetGpcClkVfOffset` como alternativa) y el aviso de poner siempre el tope antes de subir la curva
 vienen de [Green Curve](https://github.com/aufkrawall/green-curve) de aufkrawall (licencia MIT), el mismo
-proyecto en el que se basan NV-UV y NV-UV Play. Este repositorio no contiene código de NV-UV, que es software cerrado.
+proyecto en el que se apoyan NV-UV y NV-UV Play. Este repositorio no contiene código de NV-UV, que es
+software cerrado.
