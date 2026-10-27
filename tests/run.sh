@@ -22,6 +22,11 @@ gcc "${cflags[@]}" -o "$work/full/nvml.dll" "$root/tests/mock_nvml.c"
 gcc "${cflags[@]}" -DLEGACY_ONLY -o "$work/legacy/nvml.dll" "$root/tests/mock_nvml.c"
 
 state_file="$work/state" log_file="$work/log"
+if (( windows )); then
+    # Git Bash puede tener ProgramFiles y PROGRAMFILES; Windows no distingue mayúsculas y se quedaría con
+    # cualquiera de las dos.
+    while read -r name; do unset "$name"; done < <(compgen -e | grep -ix 'programfiles')
+fi
 MOCK_NVML_STATE=$(native "$state_file") MOCK_NVML_LOG=$(native "$log_file") ProgramFiles=$(native "$work/pf")
 export MOCK_NVML_STATE MOCK_NVML_LOG ProgramFiles
 config="$work/pf/uv4070/config.json"
@@ -50,6 +55,12 @@ check() {  # check <nombre> <condición...>
         echo "$out" | sed 's/^/  | /'; failures=$((failures + 1))
     fi
 }
+
+seen=$("$pwsh" -NoProfile -NonInteractive -Command '$env:ProgramFiles' | tr -d '\r')
+if [[ $seen != "$ProgramFiles" ]]; then
+    echo "PowerShell ve ProgramFiles=$seen en vez de $ProgramFiles: las pruebas usarían la carpeta real." >&2
+    exit 1
+fi
 
 run full status
 check 'status muestra la GPU, el offset y que no hay configuración' \
@@ -137,7 +148,7 @@ run full apply -MaxMHz 2610 -OffsetMHz 400
 check 'offset fuera de rango: rechazado' eval '[[ $rc != 0 && -z $calls ]]'
 
 run full apply -MaxMHz 2610 -OffsetMHz 120
-applylog=$(ls -t "$work"/pf/uv4070/logs/*-apply.jsonl 2>/dev/null | head -1)
+applylog=$(ls -t "$work"/pf/uv4070/logs/*-apply.jsonl 2>/dev/null | head -1 || true)
 check 'apply deja un registro JSON Lines' \
     eval '[[ -n $applylog ]] && grep -q "\"event\":\"session\"" "$applylog" && grep -q "\"op\":\"set-cap\"" "$applylog" && grep -q "\"event\":\"end\"" "$applylog"'
 
@@ -148,7 +159,7 @@ check 'selftest sin la 4070 en DirectX: lo dice y deja la GPU de fábrica' \
 printf '%s\n' '{"t":"2026-01-01T00:00:00","event":"error","stack":"at x, C:\\Users\\pruebauser\\uv4070.ps1: line 1"}' \
     > "$work/pf/uv4070/logs/20000101-000000-tune.jsonl"
 USERNAME=pruebauser run full report
-report=$(ls "$work"/uv4070-report-*.json 2>/dev/null | head -1)
+report=$(ls "$work"/uv4070-report-*.json 2>/dev/null | head -1 || true)
 check 'report: un JSON con estado y registros, sin el usuario' \
     eval '[[ $rc == 0 && -n $report ]] && grep -q "\"about\"" "$report" && grep -q "20000101-000000-tune.jsonl" "$report" && grep -q "selftest" "$report" && ! grep -q pruebauser "$report" && grep -q "%USERNAME%" "$report"'
 
