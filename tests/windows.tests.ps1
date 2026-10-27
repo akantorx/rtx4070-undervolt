@@ -40,22 +40,23 @@ function Get-Statuses {
 Check "Add-Type compila el C# en PowerShell $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)" ([bool]('Uv4070.Stress' -as [type]))
 
 # --- Test de estrés sobre WARP ---
-$engine = [Uv4070.Stress]::Open($warp)
+# Ojo: no llamar $engine a nada aquí; es la misma variable que $script:Engine del script.
+$warpEngine = [Uv4070.Stress]::Open($warp)
 try {
-    $engine.Calibrate(15)
-    $engine.CaptureReference()
-    Check ('WARP: calibración y referencia ({0} iteraciones, {1:N1} ms por dispatch)' -f $engine.Iterations, $engine.DispatchMs) ($engine.Iterations -ge 64)
-    $r = $engine.Run(3, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
+    $warpEngine.Calibrate(15)
+    $warpEngine.CaptureReference()
+    Check ('WARP: calibración y referencia ({0} iteraciones, {1:N1} ms por dispatch)' -f $warpEngine.Iterations, $warpEngine.DispatchMs) ($warpEngine.Iterations -ge 64)
+    $r = $warpEngine.Run(3, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
     Check 'WARP: carga sostenida sin errores' (-not $r.Failure -and $r.Batches -gt 2 -and $r.Tflops -gt 0 -and $r.LowTflops -le $r.Tflops) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
-    $r = $engine.Run(4, [IntPtr]::Zero, [Uv4070.Stress]::Pulses)
+    $r = $warpEngine.Run(4, [IntPtr]::Zero, [Uv4070.Stress]::Pulses)
     Check 'WARP: pulsos de carga sin errores' (-not $r.Failure -and $r.Batches -gt 0) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
-    $r = $engine.Run(2, [IntPtr]::Zero, [Uv4070.Stress]::Light)
+    $r = $warpEngine.Run(2, [IntPtr]::Zero, [Uv4070.Stress]::Light)
     Check 'WARP: carga ligera sin errores' (-not $r.Failure -and $r.Batches -gt 0) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
-    $engine.Iterations += 8
-    $r = $engine.Run(1, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
+    $warpEngine.Iterations += 8
+    $r = $warpEngine.Run(1, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
     Check 'WARP: detecta resultados erróneos' ($r.Failure -eq 'errores de cálculo' -and $r.Errors -ge [Uv4070.Stress]::Threads) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
 } finally {
-    $engine.Dispose()
+    $warpEngine.Dispose()
 }
 $message = try { [Uv4070.Stress]::Open($GpuName).Dispose(); 'abrió' } catch { $_.Exception.InnerException.Message }
 Check 'DirectX: sin la 4070 lo dice y lista los adaptadores' ($message -match 'DirectX no encuentra' -and $message -match [regex]::Escape($warp)) $message

@@ -59,6 +59,9 @@ static class Harness {
             s.Iterations -= 1;
             r = s.Run(2, nvml, Stress.Steady);
             Check(r.Failure == null, "vuelve a pasar con los parámetros correctos");
+            s.Dispose();
+            r = s.Run(1, nvml, Stress.Steady);
+            Check(s.Lost && r.Failure != null, "tras Dispose, Run da un fallo en vez de usar punteros liberados");
         }
 
         Console.WriteLine(failures == 0 ? "Todas las pruebas del test de estrés pasan." : failures + " prueba(s) fallida(s)");
