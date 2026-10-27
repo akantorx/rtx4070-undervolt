@@ -932,7 +932,7 @@ void main(uint3 id : SV_DispatchThreadID)
         [StructLayout(LayoutKind.Sequential)] struct BuildInputs { public uint Type, Flags, NumDescs, DescsLayout; public ulong Descs; }
         [StructLayout(LayoutKind.Sequential)] struct BuildDesc { public ulong Dest; public BuildInputs Inputs; public ulong Source, Scratch; }
         [StructLayout(LayoutKind.Sequential)] struct PrebuildInfo { public ulong ResultSize, ScratchSize, UpdateScratchSize; }
-        [StructLayout(LayoutKind.Sequential)] struct Options5 { public int SrvOnlyTiledResourceTier3; public uint TiledResourcesTier, RenderPassTier, RaytracingTier; }
+        [StructLayout(LayoutKind.Sequential)] struct Options5 { public int SrvOnlyTiledResourceTier3; public uint RenderPassesTier, RaytracingTier; }  // 12 bytes
 
         const uint HeapDefault = 1, HeapUpload = 2, HeapReadback = 3;
         const uint FlagAllowUav = 0x8;
@@ -1025,7 +1025,7 @@ void main(uint3 id : SV_DispatchThreadID)
                 Com.Release(ref adapter);
             }
             Options5 options = new Options5();
-            Com.Check(Com.Fn<CheckFeatureSupportFn>(device, 13)(device, 27 /* D3D12_OPTIONS5 */, ref options, 16), "CheckFeatureSupport");
+            Com.Check(Com.Fn<CheckFeatureSupportFn>(device, 13)(device, 27 /* D3D12_OPTIONS5 */, ref options, 12), "CheckFeatureSupport");
             if (options.RaytracingTier < 11) throw new InvalidOperationException("Este adaptador no admite ray tracing en línea (DXR 1.1): nivel " + options.RaytracingTier);
             removedReason = Com.Fn<DeviceRemovedReasonFn>(device, 37);
 
