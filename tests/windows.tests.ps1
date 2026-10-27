@@ -68,8 +68,9 @@ try {
     $warpRt.Calibrate(15)
     $warpRt.CaptureReference()
     Check ('WARP RT: calibración y referencia ({0} rayos por hilo, {1:N1} ms por dispatch)' -f $warpRt.Iterations, $warpRt.DispatchMs) ($warpRt.Iterations -ge 1 -and $warpRt.DispatchMs -gt 0)
+    # Sin núcleos RT cada dispatch tarda varios segundos: en 3 s puede completarse un solo lote.
     $r = $warpRt.Run(3, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
-    Check 'WARP RT: carga sostenida sin errores' (-not $r.Failure -and $r.Batches -gt 1) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
+    Check 'WARP RT: carga sostenida sin errores' (-not $r.Failure -and $r.Batches -ge 1) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
     $warpRt.Iterations += 1
     $r = $warpRt.Run(1, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
     Check 'WARP RT: detecta resultados erróneos' ($r.Failure -eq 'errores de cálculo' -and $r.Errors -ge [Uv4070.RtStress]::Threads) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
