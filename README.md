@@ -36,7 +36,7 @@ que "subir la curva y aplanarla" en Afterburner.
    **30 MHz de margen** bajo el último valor estable (`-MarginMHz`). Si dos pasos seguidos más offset ya no reduce el
    consumo (la tensión ya está en el mínimo de la curva), se detiene sin arriesgar más. Mientras la GPU
    está pegada al límite de potencia el consumo no baja aunque el undervolt avance, así que ahí no cuenta.
-3. **Confirma** el resultado con unos 10 minutos más de estrés. Si falla, baja 15 MHz y vuelve a confirmar.
+3. **Confirma** el resultado con unos 15 minutos más de estrés. Si falla, baja 15 MHz y vuelve a confirmar.
    Al final vuelve a medir la tarjeta de serie, ya caliente, para que la comparación sea justa. Si tenías
    un límite de potencia guardado (`install -PowerPct`), lo conserva.
 

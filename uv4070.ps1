@@ -7,7 +7,7 @@
     menos consume perdiendo como mucho un 1 % de reloj (-MaxLossPct). Mide la
     tarjeta de serie, pone el tope, baja la tensión hasta el límite estable de
     tu chip con un test de estrés propio, deja un margen de seguridad
-    (-MarginMHz, 30 por defecto) y lo confirma con unos 10 minutos más de estrés.
+    (-MarginMHz, 30 por defecto) y lo confirma con unos 15 minutos más de estrés.
 
     La estabilidad se comprueba con dos tests propios: uno de cálculo (DirectX 11)
     y otro de ray tracing (DirectX 12), y en cada uno se comparan los resultados
@@ -99,7 +99,7 @@ $Bound = $PSBoundParameters
 
 # Ajuste automático (tune). Los relojes van en múltiplos de 15 MHz, el paso de Ada.
 $OffsetStep = 30       # búsqueda gruesa; después afina en pasos de 15
-$ConfirmScale = 7      # la confirmación dura 7 rondas de búsqueda (unos 10 minutos)
+$ConfirmScale = 7      # la confirmación dura 7 rondas de búsqueda (unos 15 minutos con el tope)
 $WarmupSeconds = 60
 $SafeMHz = 1500        # reloj al que se calcula la referencia del test de estrés
 $TestScale = 1         # multiplica la duración de todas las cargas (las pruebas automáticas lo reducen)
@@ -1769,7 +1769,7 @@ function Invoke-Tune($Device) {
     Write-Host '  1. Mide la tarjeta de serie: rendimiento, consumo y reloj máximo.'
     Write-Host "  2. Con el tope un $MaxLossPct % por debajo de ese reloj, sube la curva (menos tensión) hasta que"
     Write-Host "     el test de estrés falla, y deja $MarginMHz MHz de margen."
-    Write-Host '  3. Lo confirma con unos 10 minutos más de estrés y lo guarda.'
+    Write-Host '  3. Lo confirma con unos 15 minutos más de estrés y lo guarda.'
     Write-Host 'Cierra juegos, navegadores y todo lo que use la GPU. Puede que la pantalla parpadee o que'
     Write-Host 'el driver se reinicie: es normal y no daña la tarjeta. Si el PC se llega a colgar,'
     Write-Host 'reinícialo y vuelve a ejecutar tune: seguirá donde lo dejó.'
@@ -1873,7 +1873,7 @@ function Invoke-Tune($Device) {
 
         $offset = [int]$state.Best
         while ($true) {
-            Write-Phase "3/3  Confirmación: tope $target MHz, offset +$offset MHz (unos 10 minutos)"
+            Write-Phase "3/3  Confirmación: tope $target MHz, offset +$offset MHz (unos 15 minutos)"
             $state.Testing = $offset
             Save-TuneState $state
             $result = Test-Stability $Device $target $offset $ConfirmScale
