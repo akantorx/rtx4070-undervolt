@@ -13,6 +13,7 @@ Descarga `uv4070.ps1` y `uv4070.cmd` en la misma carpeta, abre **Terminal (Admin
 carpeta y ejecuta:
 
 ```powershell
+.\uv4070.cmd selftest   # la primera vez: comprueba en 2 minutos que todo funciona en tu PC
 .\uv4070.cmd tune
 ```
 
@@ -78,9 +79,48 @@ Para probar tu configuración cuando quieras, por ejemplo tras actualizar el dri
 | `install` | Aplica la configuración en cada inicio de sesión y al volver de suspensión, con una tarea programada. |
 | `uninstall` | Quita la tarea y vuelve a valores de fábrica (la configuración guardada se conserva). |
 | `reset` | Vuelve a valores de fábrica hasta el próximo `apply` o reinicio. |
+| `selftest` | Comprueba en tu PC, una a una, las piezas que dependen del driver y de Windows (ver abajo). |
+| `report` | Junta estado, configuración, último `tune` y registros en un solo JSON para revisarlo o afinarlo. |
 
 Todo se guarda en `C:\Program Files\uv4070`: la copia del script que usa la tarea, `config.json`, el
 informe y el registro. Solo un administrador puede modificar esa carpeta.
+
+## Si algo falla, o para afinarlo
+
+`selftest` prueba en unos 2 minutos lo que solo se puede comprobar con tu tarjeta y tu driver. Los
+cambios que hace son mínimos (tope de 1500 MHz, +15 MHz de offset con ese tope, 95 % de potencia) y
+los deshace al terminar:
+
+- que NVML lee reloj, temperatura y consumo;
+- qué API de offset tiene tu driver, y que el tope y el offset se aplican de verdad;
+- el límite de potencia;
+- que el test de estrés arranca en DirectX, que la carga lleva la GPU a P0 y que el tope se respeta
+  con la GPU al máximo;
+- que el detector de errores ve un fallo simulado;
+- el registro de eventos de Windows y una tarea programada como la de `install`.
+
+Cada línea sale como `OK`, `FALLO` o `INFO`.
+
+Todo lo que cambia algo (`tune`, `stress`, `selftest`, `apply`, `install`, la tarea de arranque...) deja
+un registro en `C:\Program Files\uv4070\logs`, en formato **JSON Lines**: una línea por evento, con
+`t` (hora), `event` y claves en inglés. Por ejemplo:
+
+```json
+{"t":"...","event":"tune-step","failure":"errores de cálculo a 2715 MHz","offset":180,"target":2715,"watts":182.4}
+```
+
+Los eventos son `session`, `gpu`, `nvml` (cada escritura con su código de retorno y lectura posterior),
+`engine`, `load` (cada carga del test con tope, offset, modo y resultado), `tune-*` (cada decisión del
+ajuste), `selftest`, `error` (con la línea del script) y `end`.
+
+```powershell
+.\uv4070.cmd report
+```
+
+Esto crea `uv4070-report-<fecha>.json` en la carpeta actual. Junta el estado, la configuración, el
+resultado del último `tune` y los últimos registros de cada comando, y empieza con una explicación de su
+propio formato. Se quitan tu nombre de usuario y el nombre del equipo. Puedes adjuntarlo tal cual a una
+IA, o a quien te ayude, para revisar un fallo o afinar el ajuste.
 
 ## Requisitos
 
@@ -107,13 +147,15 @@ informe y el registro. Solo un administrador puede modificar esa carpeta.
 - **Lo he escrito sin acceso a una RTX 4070.** Lo verificado:
   - La lógica (orden de escrituras, búsqueda, margen, reanudación, rollback) contra un NVML y una 4070
     simulados (`tests/run.sh`).
-  - El test de estrés DirectX 11 ejecutándose de verdad, con el compilador de shaders de Microsoft,
-    bajo Wine y su D3D11 por software (`tests/stress-wine.sh`).
-  - Que el código C# compila como C# 5, el que admite el PowerShell de Windows.
+  - En Windows de verdad, con GitHub Actions y sin GPU (`.github/workflows/tests.yml`):
+    - todo lo anterior con Windows PowerShell 5.1 y con PowerShell 7;
+    - el test de estrés sobre el DirectX 11 de Windows por software (WARP);
+    - `selftest` y `tune` completos con ese motor;
+    - `install`, con la tarea de arranque ejecutándose como SYSTEM, y `uninstall`.
+  - El test de estrés también bajo Wine, con el compilador de shaders de Microsoft (`tests/stress-wine.sh`).
 
-  Lo que solo se verá en tu PC: cómo responde el driver real, si la carga llega a P0 (`tune` lo
-  comprueba y se niega si no) y las cifras de consumo y reloj. Si algo falla, el script vuelve a fábrica y
-  muestra el error.
+  Lo que solo se ve con tu tarjeta (cómo responde el driver de NVIDIA, si la carga llega a P0, las cifras
+  reales) es justo lo que comprueba `selftest`. Si algo falla, el script vuelve a fábrica y muestra el error.
 - El test de estrés carga los núcleos de cálculo, que es lo que limita un undervolt, pero no los de
   ray tracing ni los tensor. Tras `tune`, juega a algo exigente con RT. Si un juego se cierra o el driver
   se reinicia, baja el offset 15 MHz (`.\uv4070.cmd install -OffsetMHz <valor - 15>`).
@@ -130,6 +172,9 @@ En Linux, con `gcc` y PowerShell 7 (y `mcs` de Mono para la comprobación de C# 
 tests/run.sh                       # PWSH=/ruta/a/pwsh si no está en el PATH
 D3DCOMPILER=... tests/stress-wine.sh   # test de estrés bajo Wine; requisitos dentro del script
 ```
+
+En cada push, GitHub Actions ejecuta `tests/run.sh` en Linux y en Windows (con PowerShell 5.1 y 7) y
+`tests/windows.tests.ps1` en Windows. Los registros y el informe de esa ejecución quedan como artefactos.
 
 ## Créditos
 

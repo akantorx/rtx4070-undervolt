@@ -1,9 +1,11 @@
-# Prueba la lógica de tune y stress de uv4070.ps1 con el NVML simulado y un motor
+﻿# Prueba la lógica de tune y stress de uv4070.ps1 con el NVML simulado y un motor
 # de estrés falso que imita una 4070: curva de tensión, consumo y un chip que deja
 # de ser estable con +180 MHz de offset. Lo lanza tests/run.sh.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $root 'uv4070.ps1')
+# Fallos del NVML simulado desde este proceso (el entorno no sirve: .NET no cambia el que ve getenv).
+Add-Type -Namespace Uv4070Tests -Name Mock -MemberDefinition '[DllImport("nvml.dll")] public static extern void mockSetFail(string flags);'
 
 $Yes = $true
 $script:Failures = 0
@@ -51,10 +53,17 @@ function Get-FakeResult {
 
 function New-StressEngine {
     $script:EnginesCreated++
-    $engine = [pscustomobject]@{ Lost = $false; Iterations = 1000 }
+    $engine = [pscustomobject]@{ Lost = $false; Iterations = 1000; DispatchMs = 10.0 }
     $engine | Add-Member ScriptMethod Calibrate { param($ms) }
     $engine | Add-Member ScriptMethod CaptureReference { }
-    $engine | Add-Member ScriptMethod Run { param($seconds, $device, $mode) $script:Mode = $mode; Get-FakeResult }
+    $engine | Add-Member ScriptMethod Run {
+        param($seconds, $device, $mode)
+        $script:Mode = $mode
+        $r = Get-FakeResult
+        # Con otras iteraciones ningún hash coincide con la referencia, como en el motor real.
+        if ($this.Iterations -ne 1000) { $r.Failure = 'errores de cálculo'; $r.Errors = 1048576 }
+        $r
+    }
     $engine | Add-Member ScriptMethod Dispose { }
     $engine
 }
@@ -65,6 +74,10 @@ function Start-Case([string]$StateJson) {
     $env:ProgramFiles = $dir
     New-Item -ItemType Directory -Path (Get-DataDir) | Out-Null
     Set-Content -LiteralPath $env:MOCK_NVML_STATE -Value '0 0 0 200000'
+    if (Test-Path -LiteralPath $env:MOCK_NVML_LOG) { Remove-Item -LiteralPath $env:MOCK_NVML_LOG }
+    [Uv4070Tests.Mock]::mockSetFail('')
+    $script:LogPath = $null
+    $script:SelfTestResults = @()
     if ($StateJson) { Set-Content -LiteralPath (Join-Path (Get-DataDir) 'tune-state.json') -Value $StateJson }
     $script:FakeLimit = 180; $script:FakeP0 = 100; $script:FailAtStock = $false; $script:FakeVminMHz = 2250
     $script:LoseAtOffset = -1; $script:Lost = $false
@@ -91,13 +104,25 @@ Check 'último estable: ignora aprobados por encima de un fallo' ((Get-HighestPa
 
 # --- tune completo ---
 Start-Case
+Start-Log 'tune'
 $out = Invoke-Case
 $config = Read-Config
 Check 'tune: termina sin errores' ($out -notmatch 'EXCEPCION') $out
 Check 'tune: tope 2715 (-3 % de 2805) y máximo estable 165 - margen 30' ($config.MaxMHz -eq 2715 -and $config.OffsetMHz -eq 135) ($config | ConvertTo-Json -Compress)
 Check 'tune: deja aplicada la configuración' ((Get-Content $env:MOCK_NVML_STATE) -eq '135 0 2715 200000') (Get-Content $env:MOCK_NVML_STATE)
-Check 'tune: informe guardado y con comparación' ((Get-Content (Join-Path (Get-DataDir) 'tune-report.txt') -Raw) -match 'Consumo.*-\d') $out
+Check 'tune: informe guardado y con comparación' ((Get-Content (Join-Path (Get-DataDir) 'tune-report.txt') -Raw -Encoding UTF8) -match 'Consumo.*-\d') $out
 Check 'tune: borra el estado y lo instala con -Yes' (-not (Test-Path (Join-Path (Get-DataDir) 'tune-state.json')) -and $script:Installs -eq 1)
+$summary = Get-Content (Join-Path (Get-DataDir) 'tune-report.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+Check 'tune: tune-report.json con la configuración y la búsqueda' ($summary.config.MaxMHz -eq 2715 -and $summary.highestStableOffset -eq 165 -and @($summary.failed) -contains 180 -and $summary.stock.Watts -gt $summary.final.Watts) ($summary | ConvertTo-Json -Compress -Depth 4)
+$events = @(Get-Content -LiteralPath $script:LogPath -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
+$names = @($events | ForEach-Object { $_.event })
+Check 'registro: cada línea es JSON y lleva las decisiones de tune' (@($names | Where-Object { $_ -eq 'tune-step' }).Count -eq 7 -and
+    $names -contains 'tune-baseline' -and $names -contains 'tune-best' -and $names -contains 'tune-confirm' -and $names -contains 'tune-result' -and
+    $names -contains 'load' -and $names -contains 'nvml' -and $names -contains 'engine') ($names -join ',')
+$failedStep = @($events | Where-Object { $_.event -eq 'tune-step' -and $_.offset -eq 180 })
+Check 'registro: el paso que falla lleva el motivo y el consumo' ($failedStep.Count -eq 1 -and $failedStep[0].failure -match 'errores de cálculo a 2715 MHz') ($failedStep | ConvertTo-Json -Compress)
+$load = @($events | Where-Object { $_.event -eq 'load' })[0]
+Check 'registro: las cargas llevan tope, offset, modo y resultado' ($null -ne $load.result.watts -and $load.mode -in 'steady', 'pulses', 'light' -and $null -ne $load.cap) ($load | ConvertTo-Json -Compress)
 Check 'tune: un solo motor de estrés' ($script:EnginesCreated -eq 1) $script:EnginesCreated
 Check 'tune: muestra la búsqueda con el consumo' ($out -match '\+180 MHz  falla: errores de cálculo a 2715 MHz' -and $out -match '\+165 MHz  estable +\d+ W') $out
 Check 'tune: el informe compara reloj máximo y consumo' ($out -match 'Reloj máximo +2805 MHz +2715 MHz +-3\.2 %' -and $out -match 'Consumo +198 W +\d+ W +-') $out
@@ -163,6 +188,25 @@ Check 'stress: configuración inestable' ($out -match 'INESTABLE: errores de cá
 Start-Case
 $out = try { Invoke-StressTest $script:Dev ([pscustomobject]@{ MaxMHz = $null; OffsetMHz = $null; PowerPct = 100 }) 1 *>&1 | Out-String } catch { 'EXCEPCION: ' + $_.Exception.Message }
 Check 'stress: sin configuración prueba de serie' ($out -match 'de serie' -and $out -match 'ESTABLE') $out
+
+# --- selftest ---
+Start-Case
+$out = try { Invoke-SelfTest $script:Dev *>&1 | Out-String } catch { 'EXCEPCION: ' + $_.Exception.Message }
+$status = @{}
+foreach ($r in $script:SelfTestResults) { $status[$r.Name] = $r.Status }
+$expected = 'lecturas', 'lectura-offset', 'tope-reloj', 'escritura-offset', 'potencia', 'directx11', 'tope-efectivo', 'carga-de-serie', 'pulsos', 'deteccion-errores'
+Check 'selftest: todo correcto con el NVML simulado' ($out -notmatch 'EXCEPCION' -and @($expected | Where-Object { $status[$_] -ne 'ok' }).Count -eq 0) $out
+Check 'selftest: deja la GPU de fábrica' ((Get-Content $env:MOCK_NVML_STATE) -eq '0 0 0 200000') (Get-Content $env:MOCK_NVML_STATE)
+
+Start-Case
+[Uv4070Tests.Mock]::mockSetFail('lock')
+$out = try { Invoke-SelfTest $script:Dev *>&1 | Out-String } catch { 'EXCEPCION: ' + $_.Exception.Message }
+$status = @{}
+foreach ($r in $script:SelfTestResults) { $status[$r.Name] = $r.Status }
+$wrote = if (Test-Path $env:MOCK_NVML_LOG) { Get-Content $env:MOCK_NVML_LOG -Raw } else { '' }
+Check 'selftest: sin tope no prueba el offset y lo cuenta como fallo' ($out -match 'EXCEPCION.*FALLO' -and $status['tope-reloj'] -eq 'fail' -and
+    $status['escritura-offset'] -eq 'fail' -and $wrote -notmatch 'offset 15') "$out $wrote"
+[Uv4070Tests.Mock]::mockSetFail('')
 
 [void][Uv4070.Nvml]::Shutdown()
 Write-Host ''

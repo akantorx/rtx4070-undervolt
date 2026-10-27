@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: mcs, para comprobar que el C# compila como C# 5
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mono-mcs
+      - name: tests/run.sh (PowerShell 7)
+        run: tests/run.sh
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]   # Windows PowerShell 5.1 y PowerShell 7
+    steps:
+      - uses: actions/checkout@v4
+      - name: tests/run.sh con ${{ matrix.shell }}
+        shell: bash
+        env:
+          PWSH: ${{ matrix.shell }}.exe
+        run: tests/run.sh
+      - name: NVML simulado para las pruebas de Windows
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/mock" /c/tmp
+          gcc -shared -O2 -Wall -Werror -o "$RUNNER_TEMP/mock/nvml.dll" tests/mock_nvml.c
+      - name: tests/windows.tests.ps1 con ${{ matrix.shell }}
+        shell: ${{ matrix.shell }}
+        env:
+          MOCK_NVML_STATE: C:\tmp\mock_nvml_state
+          MOCK_NVML_LOG: C:\tmp\mock_nvml_log
+        run: ./tests/windows.tests.ps1 -MockDir "$env:RUNNER_TEMP\mock" -ArtifactsDir "$env:RUNNER_TEMP\artifacts"
+      - name: Registros e informe de la prueba
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uv4070-windows-${{ matrix.shell }}
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: ignore

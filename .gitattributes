@@ -1,1 +1,4 @@
 *.cmd text eol=crlf
+*.sh text eol=lf
+*.c text eol=lf
+*.yml text eol=lf

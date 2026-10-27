@@ -24,6 +24,11 @@
       monitor    Reloj, consumo y temperatura cada segundo (Ctrl+C para salir).
       install    Aplica la configuración en cada inicio de sesión y al volver de suspensión.
       uninstall  Quita el arranque automático y vuelve a valores de fábrica.
+      selftest   Comprueba en este PC el driver, DirectX y Windows (unos 2 minutos).
+      report     Junta estado, último tune y registros en un JSON para revisarlo (también con una IA).
+
+    Cada comando que cambia algo deja un registro JSON Lines en
+    C:\Program Files\uv4070\logs: una línea por evento, con claves en inglés.
 
 .EXAMPLE
     .\uv4070.ps1 tune
@@ -38,7 +43,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('status', 'tune', 'stress', 'apply', 'reset', 'monitor', 'install', 'uninstall')]
+    [ValidateSet('status', 'tune', 'stress', 'apply', 'reset', 'monitor', 'install', 'uninstall', 'selftest', 'report')]
     [string]$Command = 'status',
 
     # Tope de reloj del núcleo. Sin él se usa el de la configuración guardada.
@@ -77,6 +82,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+$ScriptVersion = '2026.10.27'
 $GpuName = 'NVIDIA GeForce RTX 4070'
 $TaskName = 'uv4070'
 $OnWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or $IsWindows
@@ -88,6 +94,7 @@ $OffsetMargin = 30     # margen de seguridad bajo el último offset estable
 $ConfirmScale = 7      # la confirmación dura 7 rondas de búsqueda (unos 10 minutos)
 $WarmupSeconds = 60
 $SafeMHz = 1500        # reloj al que se calcula la referencia del test de estrés
+$TestScale = 1         # multiplica la duración de todas las cargas (las pruebas automáticas lo reducen)
 
 if (-not ('Uv4070.Nvml' -as [type])) {
     # C# 5 como máximo: es lo que compila Windows PowerShell 5.1.
@@ -134,6 +141,8 @@ namespace Uv4070 {
         static extern IntPtr nvmlErrorString(int result);
         [DllImport(Dll, CallingConvention = C, EntryPoint = "nvmlSystemGetDriverVersion", CharSet = CharSet.Ansi)]
         public static extern int GetDriverVersion(StringBuilder version, uint length);
+        [DllImport(Dll, CallingConvention = C, EntryPoint = "nvmlSystemGetNVMLVersion", CharSet = CharSet.Ansi)]
+        public static extern int GetNvmlVersion(StringBuilder version, uint length);
         [DllImport(Dll, CallingConvention = C, EntryPoint = "nvmlDeviceGetCount_v2")]
         public static extern int GetCount(out uint count);
         [DllImport(Dll, CallingConvention = C, EntryPoint = "nvmlDeviceGetHandleByIndex_v2")]
@@ -200,29 +209,29 @@ namespace Uv4070 {
             return o;
         }
 
-        // API moderna (driver R555+) y, si no está o falla, la anterior.
-        public static int SetGraphicsOffset(IntPtr device, int mhz) {
-            int rc = Missing;
-            try {
-                ClockOffset o = GraphicsP0();
-                o.OffsetMHz = mhz;
-                rc = nvmlDeviceSetClockOffsets(device, ref o);
-                if (rc == Success) return rc;
-            } catch (EntryPointNotFoundException) { }
-            try { rc = nvmlDeviceSetGpcClkVfOffset(device, mhz); } catch (EntryPointNotFoundException) { }
-            return rc;
-        }
-
-        // minMHz y maxMHz quedan a 0 si el driver no informa del rango.
-        public static int GetGraphicsOffset(IntPtr device, out int mhz, out int minMHz, out int maxMHz) {
+        // Las dos API de offset por separado: la moderna (driver R555+), por
+        // P-state, y la anterior, global. selftest las prueba una a una.
+        public static int GetOffsetModern(IntPtr device, out int mhz, out int minMHz, out int maxMHz) {
             mhz = 0; minMHz = 0; maxMHz = 0;
             try {
                 ClockOffset o = GraphicsP0();
-                if (nvmlDeviceGetClockOffsets(device, ref o) == Success) {
-                    mhz = o.OffsetMHz; minMHz = o.MinOffsetMHz; maxMHz = o.MaxOffsetMHz;
-                    return Success;
-                }
-            } catch (EntryPointNotFoundException) { }
+                int rc = nvmlDeviceGetClockOffsets(device, ref o);
+                if (rc == Success) { mhz = o.OffsetMHz; minMHz = o.MinOffsetMHz; maxMHz = o.MaxOffsetMHz; }
+                return rc;
+            } catch (EntryPointNotFoundException) { return Missing; }
+        }
+
+        public static int SetOffsetModern(IntPtr device, int mhz) {
+            try {
+                ClockOffset o = GraphicsP0();
+                o.OffsetMHz = mhz;
+                return nvmlDeviceSetClockOffsets(device, ref o);
+            } catch (EntryPointNotFoundException) { return Missing; }
+        }
+
+        // minMHz y maxMHz quedan a 0 si el driver no informa del rango.
+        public static int GetOffsetLegacy(IntPtr device, out int mhz, out int minMHz, out int maxMHz) {
+            mhz = 0; minMHz = 0; maxMHz = 0;
             int rc;
             try { rc = nvmlDeviceGetGpcClkVfOffset(device, out mhz); } catch (EntryPointNotFoundException) { return Missing; }
             if (rc != Success) return rc;
@@ -230,6 +239,23 @@ namespace Uv4070 {
                 if (nvmlDeviceGetGpcClkMinMaxVfOffset(device, out minMHz, out maxMHz) != Success) { minMHz = 0; maxMHz = 0; }
             } catch (EntryPointNotFoundException) { }
             return Success;
+        }
+
+        public static int SetOffsetLegacy(IntPtr device, int mhz) {
+            try { return nvmlDeviceSetGpcClkVfOffset(device, mhz); } catch (EntryPointNotFoundException) { return Missing; }
+        }
+
+        // La API moderna y, si no está o falla, la anterior.
+        public static int SetGraphicsOffset(IntPtr device, int mhz) {
+            int rc = SetOffsetModern(device, mhz);
+            if (rc == Success) return rc;
+            int legacy = SetOffsetLegacy(device, mhz);
+            return legacy == Missing ? rc : legacy;
+        }
+
+        public static int GetGraphicsOffset(IntPtr device, out int mhz, out int minMHz, out int maxMHz) {
+            if (GetOffsetModern(device, out mhz, out minMHz, out maxMHz) == Success) return Success;
+            return GetOffsetLegacy(device, out mhz, out minMHz, out maxMHz);
         }
 
         public static int GetClockReasons(IntPtr device, out ulong reasons) {
@@ -689,6 +715,55 @@ function Assert-Admin {
 # solo un administrador puede modificarlos.
 function Get-DataDir { Join-Path $env:ProgramFiles 'uv4070' }
 
+# Registro estructurado: un archivo JSON Lines por ejecución en <datos>\logs (se
+# guardan los 10 últimos de cada comando). Cada línea es un objeto con "t" (hora ISO 8601),
+# "event" y sus datos, con claves en inglés, pensado para que lo analice una
+# persona o una IA. El comando report los junta en un solo archivo.
+$script:LogPath = $null
+
+function Start-Log([string]$Name) {
+    try {
+        $dir = Join-Path (Get-DataDir) 'logs'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        # Los 10 últimos de cada comando: los apply del arranque no borran los de tune.
+        Get-ChildItem -LiteralPath $dir -Filter "*-$Name.jsonl" | Sort-Object Name -Descending | Select-Object -Skip 9 | Remove-Item -Force
+        $script:LogPath = Join-Path $dir ('{0:yyyyMMdd-HHmmss}-{1}.jsonl' -f (Get-Date), $Name)
+    } catch {
+        Write-Warning "No se puede crear el registro: $($_.Exception.Message)"
+    }
+}
+
+# Un fallo al escribir el registro nunca interrumpe el comando.
+function Write-Log([string]$Event, [hashtable]$Data = @{}) {
+    if (-not $script:LogPath) { return }
+    $record = [ordered]@{ t = (Get-Date).ToString('o'); event = $Event }
+    foreach ($key in ($Data.Keys | Sort-Object)) { $record[$key] = $Data[$key] }   # orden estable
+    try {
+        $line = ($record | ConvertTo-Json -Compress -Depth 6) + "`n"
+        [IO.File]::AppendAllText($script:LogPath, $line, (New-Object Text.UTF8Encoding $false))
+    } catch { }
+}
+
+# Las claves de un resultado del test de estrés, redondeadas, para el registro.
+function ConvertTo-LogResult($Result) {
+    if ($null -eq $Result) { return $null }
+    [ordered]@{
+        failure = $Result.Failure; errors = $Result.Errors; deviceLost = $Result.DeviceLost; batches = $Result.Batches
+        tflops = [math]::Round($Result.Tflops, 3); lowTflops = [math]::Round($Result.LowTflops, 3)
+        watts = [math]::Round($Result.Watts, 1); clockMHz = [math]::Round($Result.ClockMHz); maxTempC = $Result.MaxTempC
+        p0Pct = [math]::Round($Result.P0Pct, 1); powerCappedPct = [math]::Round($Result.PowerCappedPct, 1)
+    }
+}
+
+function Get-OsDescription {
+    try {
+        $v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+        '{0} {1} (build {2}.{3})' -f $v.ProductName, $v.DisplayVersion, $v.CurrentBuild, $v.UBR
+    } catch {
+        [Environment]::OSVersion.VersionString
+    }
+}
+
 function Open-Rtx4070([bool]$WaitForDriver) {
     if (-not [Environment]::Is64BitProcess) { throw 'Usa PowerShell de 64 bits: nvml.dll es de 64 bits.' }
     # Al iniciar sesión o volver de suspensión el driver puede tardar en estar listo.
@@ -732,8 +807,10 @@ function Get-CoreOffset($Device) {
 }
 
 function Set-CoreOffset($Device, [int]$MHz) {
-    Assert-Nvml ([Uv4070.Nvml]::SetGraphicsOffset($Device, $MHz)) "No se pudo poner el offset a +$MHz MHz"
-    $now = Get-CoreOffset $Device
+    $rc = [Uv4070.Nvml]::SetGraphicsOffset($Device, $MHz)
+    $now = if ($rc -eq 0) { Get-CoreOffset $Device } else { $null }
+    Write-Log 'nvml' @{ op = 'set-offset'; mhz = $MHz; rc = $rc; readback = $(if ($now) { $now.MHz }) }
+    Assert-Nvml $rc "No se pudo poner el offset a +$MHz MHz"
     if ($null -ne $now -and $now.MHz -ne $MHz) {
         throw "El driver aceptó el offset de +$MHz MHz pero informa de $($now.MHz) MHz."
     }
@@ -743,7 +820,9 @@ function Set-ClockCap($Device, [int]$MaxMHz) {
     # Sin suelo (0) para que en escritorio siga bajando de reloj. Si el driver
     # no acepta 0, se usa 210 MHz, el reloj en reposo de la 4070.
     $rc = [Uv4070.Nvml]::SetLockedClocks($Device, 0, $MaxMHz)
-    if ($rc -ne 0) { $rc = [Uv4070.Nvml]::SetLockedClocks($Device, 210, $MaxMHz) }
+    $floor = 0
+    if ($rc -ne 0) { $floor = 210; $rc = [Uv4070.Nvml]::SetLockedClocks($Device, $floor, $MaxMHz) }
+    Write-Log 'nvml' @{ op = 'set-cap'; minMHz = $floor; maxMHz = $MaxMHz; rc = $rc }
     Assert-Nvml $rc "No se pudo poner el tope de $MaxMHz MHz"
 }
 
@@ -766,7 +845,7 @@ function Set-Uv($Device, [int]$MaxMHz, [int]$OffsetMHz) {
     }
 }
 
-function Set-PowerPct($Device, [int]$Pct) {
+function Set-PowerPct($Device, [int]$Pct, [switch]$Quiet) {
     $default = [uint32]0
     $rc = [Uv4070.Nvml]::GetDefaultPowerLimit($Device, [ref]$default)
     if ($rc -ne 0) {
@@ -781,8 +860,10 @@ function Set-PowerPct($Device, [int]$Pct) {
     $current = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerLimit($Device, $out) }
     if ($current -eq $target) { return }
     $watts = '{0:N0} W' -f ($target / 1000)
-    Assert-Nvml ([Uv4070.Nvml]::SetPowerLimit($Device, $target)) "No se pudo poner el límite de potencia a $watts"
-    Write-Host "Límite de potencia: $watts"
+    $rc = [Uv4070.Nvml]::SetPowerLimit($Device, $target)
+    Write-Log 'nvml' @{ op = 'set-power'; pct = $Pct; milliwatts = $target; rc = $rc }
+    Assert-Nvml $rc "No se pudo poner el límite de potencia a $watts"
+    if (-not $Quiet) { Write-Host "Límite de potencia: $watts" }
 }
 
 function Invoke-Apply($Device, $Config) {
@@ -804,11 +885,13 @@ function Reset-Stock($Device) {
     # Al revés que Set-Uv: primero el offset y luego el tope. Si el offset no
     # baja a 0, el tope se queda puesto para no convertirlo en un overclock.
     $rc = [Uv4070.Nvml]::SetGraphicsOffset($Device, 0)
+    Write-Log 'nvml' @{ op = 'reset-offset'; rc = $rc }
     if ($rc -ne 0) {
         Write-Warning ('No se pudo poner el offset a 0 ({0}); el tope de reloj se queda puesto.' -f [Uv4070.Nvml]::ErrorString($rc))
         $ok = $false
     } else {
         $rc = [Uv4070.Nvml]::ResetLockedClocks($Device)
+        Write-Log 'nvml' @{ op = 'reset-cap'; rc = $rc }
         if ($rc -ne 0) {
             Write-Warning ('No se pudo quitar el tope de reloj: {0}' -f [Uv4070.Nvml]::ErrorString($rc))
             $ok = $false
@@ -821,7 +904,7 @@ function Reset-Stock($Device) {
 function Read-Config {
     $path = Join-Path (Get-DataDir) 'config.json'
     if (-not (Test-Path -LiteralPath $path)) { return $null }
-    $config = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    $config = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
     # La tarea programada la aplica como SYSTEM: se revisa aunque solo un administrador pueda escribirla.
     if ($config.MaxMHz -lt 1500 -or $config.MaxMHz -gt 3000 -or $config.OffsetMHz -lt 0 -or
         $config.OffsetMHz -gt 300 -or $config.PowerPct -lt 50 -or $config.PowerPct -gt 100) {
@@ -869,6 +952,7 @@ function Get-Engine($Device) {
     $engine = New-StressEngine
     $engine.Calibrate(15)
     $engine.CaptureReference()
+    Write-Log 'engine' @{ iterations = $engine.Iterations; dispatchMs = [math]::Round($engine.DispatchMs, 2) }
     $script:Engine = $engine
     $engine
 }
@@ -878,15 +962,27 @@ function Close-Engine {
     $script:Engine = $null
 }
 
-# Reinicios del driver (TDR) en el registro de eventos de Windows.
+# Reinicios del driver (TDR) en el registro de eventos de Windows desde $Since.
+# Sin acceso al registro devuelve una lista vacía; Search-DriverResets da el motivo.
 function Get-DriverResets([datetime]$Since) {
-    if (-not (Get-Command Get-WinEvent -ErrorAction SilentlyContinue)) { return @() }
-    try {
-        $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'nvlddmkm', 'Display'; StartTime = $Since } -ErrorAction Stop
-    } catch {
-        return @()   # sin eventos, Get-WinEvent da error
+    $search = Search-DriverResets $Since
+    $search.Events
+}
+
+function Search-DriverResets([datetime]$Since) {
+    if (-not (Get-Command Get-WinEvent -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{ Ok = $false; Error = 'Get-WinEvent no existe aquí'; Events = @() }
     }
-    @($events | Where-Object { ($_.ProviderName -eq 'nvlddmkm' -and $_.Level -le 2) -or $_.Id -eq 4101 })
+    try {
+        $filter = @{ LogName = 'System'; ProviderName = 'nvlddmkm', 'Display'; StartTime = $Since }
+        $events = Get-WinEvent -FilterHashtable $filter -ErrorAction Stop
+    } catch {
+        # Sin eventos que coincidan, Get-WinEvent da este error: no es un fallo.
+        if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') { return [pscustomobject]@{ Ok = $true; Error = $null; Events = @() } }
+        return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message; Events = @() }
+    }
+    $resets = @($events | Where-Object { ($_.ProviderName -eq 'nvlddmkm' -and $_.Level -le 2) -or $_.Id -eq 4101 })
+    [pscustomobject]@{ Ok = $true; Error = $null; Events = $resets }
 }
 
 # Una carga con un tope y offset concretos ($Cap 0 = de serie). $Mode es
@@ -896,13 +992,18 @@ function Invoke-Step($Device, [int]$Cap, [int]$Offset, [double]$Seconds, [int]$M
     $engine = Get-Engine $Device
     if ($Cap -gt 0) { Set-Uv $Device $Cap $Offset } else { [void](Reset-Stock $Device) }
     $since = Get-Date
-    $left = $Seconds
+    $left = $Seconds * $TestScale
     do {
         $chunk = [math]::Min($left, 20)
         $left -= $chunk
         $result = $engine.Run($chunk, $Device, $Mode)
     } while (-not $result.Failure -and $left -gt 0)
-    if (-not $result.Failure -and @(Get-DriverResets $since).Count -gt 0) { $result.Failure = 'el driver se ha reiniciado' }
+    $resets = @(Get-DriverResets $since).Count
+    if (-not $result.Failure -and $resets -gt 0) { $result.Failure = 'el driver se ha reiniciado' }
+    Write-Log 'load' @{
+        cap = $Cap; offset = $Offset; seconds = $Seconds * $TestScale; mode = @('steady', 'pulses', 'light')[$Mode]
+        driverResets = $resets; result = (ConvertTo-LogResult $result)
+    }
     $result
 }
 
@@ -976,7 +1077,7 @@ function Get-HighestPass($Passed, $Failed) {
 
 function Read-TuneState {
     $path = Join-Path (Get-DataDir) 'tune-state.json'
-    if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } else { $null }
+    if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
 }
 
 function Save-TuneState($State) {
@@ -1017,7 +1118,9 @@ function Invoke-Tune($Device) {
     if ($state -and ($state.Driver -ne $driver -or $state.LossPct -ne $MaxLossPct)) { $state = $null }
     if ($state) {
         Write-Host 'Continuando el ajuste anterior.'
+        Write-Log 'tune-resume' @{ state = $state }
         if ($null -ne $state.Testing) {
+            Write-Log 'tune-hang' @{ offset = $state.Testing; duringConfirm = ($null -ne $state.Best) }
             # Si el estado aún marca una prueba en curso, el PC se colgó en ella.
             Write-Warning "El PC se colgó probando el offset +$($state.Testing) MHz: cuenta como inestable."
             if ($null -eq $state.Best) { $state.Failed = @($state.Failed) + [int]$state.Testing }
@@ -1050,6 +1153,7 @@ function Invoke-Tune($Device) {
             $state.Target = Get-TargetCap $state.BoostMHz $MaxLossPct
             Save-TuneState $state
             Write-Host ('  Reloj máximo con carga ligera: {0:F0} MHz. Tope: {1} MHz.' -f $state.BoostMHz, $state.Target)
+            Write-Log 'tune-baseline' @{ stock = $base; boostMHz = $state.BoostMHz; lossPct = $MaxLossPct; target = $state.Target }
         }
         $target = [int]$state.Target
 
@@ -1062,6 +1166,7 @@ function Invoke-Tune($Device) {
                 Save-TuneState $state
                 $result = Test-Stability $Device $target $offset 1
                 $state.Testing = $null
+                Write-Log 'tune-step' @{ target = $target; offset = $offset; failure = $result.Failure; watts = [math]::Round($result.Steady.Watts, 1) }
                 if ($result.Failure) {
                     $state.Failed = @($state.Failed) + $offset
                     Write-Host ('  +{0,3} MHz  falla: {1}' -f $offset, $result.Failure) -ForegroundColor Yellow
@@ -1080,6 +1185,7 @@ function Invoke-Tune($Device) {
             $highest = Get-HighestPass $state.Passed $state.Failed
             $state.Best = [math]::Max(0, $highest - $OffsetMargin)
             Save-TuneState $state
+            Write-Log 'tune-best' @{ highest = $highest; best = $state.Best; plateau = $state.Plateau; passed = $state.Passed; failed = $state.Failed }
             if ($state.Plateau) { Write-Host 'Más offset ya no baja el consumo: la tensión ya está en el mínimo de la curva.' }
             Write-Host "Máximo estable: +$highest MHz. Con margen: +$($state.Best) MHz."
         }
@@ -1091,6 +1197,7 @@ function Invoke-Tune($Device) {
             Save-TuneState $state
             $result = Test-Stability $Device $target $offset $ConfirmScale
             $state.Testing = $null
+            Write-Log 'tune-confirm' @{ target = $target; offset = $offset; failure = $result.Failure }
             if (-not $result.Failure) { break }
             if ($offset -eq 0) { throw "Ni sin offset pasa la confirmación ($($result.Failure)). Revisa el driver o la tarjeta." }
             Write-Warning "Falla ($($result.Failure)): se baja 15 MHz."
@@ -1106,7 +1213,15 @@ function Invoke-Tune($Device) {
             Tuned = (Get-Date).ToString('yyyy-MM-dd HH:mm'); Driver = $driver
         }
         Save-Config $config
-        $report = Format-TuneReport $state.Baseline $state.BoostMHz $final $config (Get-HighestPass $state.Passed $state.Failed)
+        $highest = Get-HighestPass $state.Passed $state.Failed
+        $summary = [ordered]@{
+            version = $ScriptVersion; tuned = $config.Tuned; driver = $driver; lossPct = $MaxLossPct
+            config = $config; boostMHz = $state.BoostMHz; stock = $state.Baseline; final = $final
+            highestStableOffset = $highest; marginMHz = $highest - $offset; passed = $state.Passed; failed = $state.Failed; plateau = $state.Plateau
+        }
+        Write-Log 'tune-result' @{ summary = $summary }
+        $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path (Get-DataDir) 'tune-report.json') -Encoding UTF8
+        $report = Format-TuneReport $state.Baseline $state.BoostMHz $final $config $highest
         $report | Set-Content -LiteralPath (Join-Path (Get-DataDir) 'tune-report.txt') -Encoding UTF8
         $report | ForEach-Object { Write-Host $_ }
         Remove-TuneState
@@ -1170,28 +1285,43 @@ function Invoke-StressTest($Device, $Config, [int]$Minutes) {
 
 # ---------------------------------------------------------------------------
 
-function Show-Status($Device) {
-    $core = Read-Nvml { param($out) [Uv4070.Nvml]::GetClock($Device, 0, $out) }
-    $mem = Read-Nvml { param($out) [Uv4070.Nvml]::GetClock($Device, 2, $out) }
-    $temp = Read-Nvml { param($out) [Uv4070.Nvml]::GetTemperature($Device, 0, $out) }
-    $usage = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerUsage($Device, $out) }
-    $limit = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerLimit($Device, $out) }
-    $default = Read-Nvml { param($out) [Uv4070.Nvml]::GetDefaultPowerLimit($Device, $out) }
-    $offset = Get-CoreOffset $Device
-
-    Write-Host "GPU:          $GpuName (driver $(Get-DriverVersion))"
-    Write-Host "Reloj:        núcleo $core MHz, memoria $mem MHz"
-    Write-Host ('Offset:       {0}' -f $(if ($offset) { '{0:+0;-0;0} MHz' -f $offset.MHz } else { 'n/d' }))
-    Write-Host 'Tope:         NVML no deja leerlo; con "monitor" en un juego se ve dónde se queda el reloj.'
-    Write-Host ('Consumo:      {0:N1} W, límite {1:N0} W (fábrica {2:N0} W)' -f ($usage / 1000), ($limit / 1000), ($default / 1000))
-    Write-Host "Temperatura:  $temp °C"
-    $config = Read-Config
-    $saved = if ($config) { "tope $($config.MaxMHz) MHz, offset +$($config.OffsetMHz) MHz, potencia $($config.PowerPct) %" } else { 'ninguna (usa "tune")' }
-    Write-Host "Guardada:     $saved"
-    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
-        $auto = if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { 'sí' } else { 'no (usa "install")' }
-        Write-Host "Al iniciar:   $auto"
+# Estado actual como objeto (lo usan status y report).
+function Get-StatusInfo($Device) {
+    $info = [ordered]@{ gpu = $GpuName; version = $ScriptVersion }
+    if ($Device) {
+        $usage = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerUsage($Device, $out) }
+        $limit = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerLimit($Device, $out) }
+        $default = Read-Nvml { param($out) [Uv4070.Nvml]::GetDefaultPowerLimit($Device, $out) }
+        $offset = Get-CoreOffset $Device
+        $info.driver = Get-DriverVersion
+        $info.coreMHz = Read-Nvml { param($out) [Uv4070.Nvml]::GetClock($Device, 0, $out) }
+        $info.memMHz = Read-Nvml { param($out) [Uv4070.Nvml]::GetClock($Device, 2, $out) }
+        $info.tempC = Read-Nvml { param($out) [Uv4070.Nvml]::GetTemperature($Device, 0, $out) }
+        $info.powerW = $(if ($null -ne $usage) { [math]::Round($usage / 1000, 1) })
+        $info.powerLimitW = $(if ($null -ne $limit) { [math]::Round($limit / 1000) })
+        $info.defaultPowerLimitW = $(if ($null -ne $default) { [math]::Round($default / 1000) })
+        $info.offsetMHz = $(if ($offset) { $offset.MHz })
     }
+    try { $info.savedConfig = Read-Config } catch { $info.savedConfig = "no válida: $($_.Exception.Message)" }
+    $info.autostart = $null
+    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+        $info.autostart = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+    }
+    $info
+}
+
+function Show-Status($Device) {
+    $s = Get-StatusInfo $Device
+    Write-Host "GPU:          $GpuName (driver $($s.driver))"
+    Write-Host "Reloj:        núcleo $($s.coreMHz) MHz, memoria $($s.memMHz) MHz"
+    Write-Host ('Offset:       {0}' -f $(if ($null -ne $s.offsetMHz) { '{0:+0;-0;0} MHz' -f $s.offsetMHz } else { 'n/d' }))
+    Write-Host 'Tope:         NVML no deja leerlo; con "monitor" en un juego se ve dónde se queda el reloj.'
+    Write-Host ('Consumo:      {0:N1} W, límite {1:N0} W (fábrica {2:N0} W)' -f $s.powerW, $s.powerLimitW, $s.defaultPowerLimitW)
+    Write-Host "Temperatura:  $($s.tempC) °C"
+    $c = $s.savedConfig
+    $saved = if ($c -is [string]) { $c } elseif ($c) { "tope $($c.MaxMHz) MHz, offset +$($c.OffsetMHz) MHz, potencia $($c.PowerPct) %" } else { 'ninguna (usa "tune")' }
+    Write-Host "Guardada:     $saved"
+    if ($null -ne $s.autostart) { Write-Host ('Al iniciar:   {0}' -f $(if ($s.autostart) { 'sí' } else { 'no (usa "install")' })) }
 }
 
 function Show-Monitor($Device, [int]$Samples) {
@@ -1221,18 +1351,12 @@ function Write-AfterburnerWarning {
     }
 }
 
-function Install-Autostart {
-    # La tarea corre como SYSTEM, así que el script se copia a Program Files,
-    # donde solo un administrador puede modificarlo, junto a config.json.
-    $dir = Get-DataDir
-    $target = Join-Path $dir 'uv4070.ps1'
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    if ($PSCommandPath -ne $target) { Copy-Item -LiteralPath $PSCommandPath -Destination $target -Force }
-
-    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" apply -Unattended' -f $target
+# Tarea programada que aplica la configuración como SYSTEM al iniciar sesión y al
+# volver de suspensión o hibernación (el driver vuelve entonces a valores de fábrica).
+function Register-AutostartTask([string]$Name, [string]$ScriptPath, [bool]$Disabled) {
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" apply -Unattended' -f $ScriptPath
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
     $logon = New-ScheduledTaskTrigger -AtLogOn
-    # El driver vuelve a valores de fábrica al despertar de suspensión o hibernación.
     $eventTrigger = Get-CimClass -Namespace 'Root/Microsoft/Windows/TaskScheduler' -ClassName 'MSFT_TaskEventTrigger'
     $resume = New-CimInstance -CimClass $eventTrigger -ClientOnly
     $resume.Enabled = $true
@@ -1241,8 +1365,20 @@ function Install-Autostart {
         "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]" +
         '</Select></Query></QueryList>'
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $logon, $resume -Principal $principal -Settings $settings -Force | Out-Null
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Disable:$Disabled `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    Register-ScheduledTask -TaskName $Name -Action $action -Trigger $logon, $resume -Principal $principal -Settings $settings -Force
+}
+
+function Install-Autostart {
+    # La tarea corre como SYSTEM, así que el script se copia a Program Files,
+    # donde solo un administrador puede modificarlo, junto a config.json.
+    $dir = Get-DataDir
+    $target = Join-Path $dir 'uv4070.ps1'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    if ($PSCommandPath -ne $target) { Copy-Item -LiteralPath $PSCommandPath -Destination $target -Force }
+    Register-AutostartTask $TaskName $target $false | Out-Null
+    Write-Log 'autostart' @{ op = 'install'; script = $target }
     Write-Host "Se aplicará solo al iniciar sesión y al volver de suspensión. Registro: $dir\uv4070.log"
 }
 
@@ -1255,7 +1391,250 @@ function Uninstall-Autostart {
         $path = Join-Path $dir $file
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
     }
+    Write-Log 'autostart' @{ op = 'uninstall' }
     Write-Host "Arranque automático eliminado. La configuración sigue en $dir\config.json."
+}
+
+# Prueba en este PC, una a una, las piezas que dependen del driver y de Windows.
+# Los cambios son mínimos (tope de $SafeMHz MHz, +15 MHz de offset con ese tope,
+# 95 % de potencia) y se deshacen al terminar.
+function Invoke-SelfTest($Device) {
+    $results = New-Object System.Collections.ArrayList
+    $add = {
+        param([string]$Name, [string]$Status, [string]$Detail, $Data)
+        [void]$results.Add([pscustomobject]@{ Name = $Name; Status = $Status; Detail = $Detail })
+        Write-Log 'selftest' @{ check = $Name; status = $Status; detail = $Detail; data = $Data }
+        $label = @{ ok = 'OK'; fail = 'FALLO'; info = 'INFO' }[$Status]
+        $color = @{ ok = 'Green'; fail = 'Red'; info = 'Gray' }[$Status]
+        Write-Host ('  {0,-6} {1,-17} {2}' -f $label, $Name, $Detail) -ForegroundColor $color
+    }
+    $nvmlName = { param($rc) if ($rc -eq 0) { 'correcto' } else { [Uv4070.Nvml]::ErrorString($rc) } }
+    Write-Host 'selftest: comprueba el driver, DirectX y Windows en este PC (unos 2 minutos).'
+    Write-Host 'Cierra juegos y programas que usen la GPU. Al terminar todo vuelve a como estaba.'
+    Write-Host ''
+
+    try {
+        $os = Get-OsDescription
+        & $add 'entorno' 'info' ('PowerShell {0} {1}, {2}' -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition, $os) @{
+            ps = $PSVersionTable.PSVersion.ToString(); edition = $PSVersionTable.PSEdition; os = $os; culture = (Get-Culture).Name
+        }
+        $nvmlVersion = New-Object System.Text.StringBuilder 80
+        [void][Uv4070.Nvml]::GetNvmlVersion($nvmlVersion, 80)
+        $driver = Get-DriverVersion
+        & $add 'driver' 'info' "driver $driver, NVML $nvmlVersion" @{ driver = $driver; nvml = $nvmlVersion.ToString() }
+
+        # Lecturas básicas.
+        $reads = [ordered]@{}
+        $failedReads = @()
+        $readers = [ordered]@{
+            coreMHz = { param($o) [Uv4070.Nvml]::GetClock($Device, 0, $o) }
+            memMHz = { param($o) [Uv4070.Nvml]::GetClock($Device, 2, $o) }
+            tempC = { param($o) [Uv4070.Nvml]::GetTemperature($Device, 0, $o) }
+            powerMilliwatts = { param($o) [Uv4070.Nvml]::GetPowerUsage($Device, $o) }
+            powerLimitMilliwatts = { param($o) [Uv4070.Nvml]::GetPowerLimit($Device, $o) }
+            defaultPowerLimitMilliwatts = { param($o) [Uv4070.Nvml]::GetDefaultPowerLimit($Device, $o) }
+            pstate = { param($o) [Uv4070.Nvml]::GetPState($Device, $o) }
+        }
+        foreach ($name in $readers.Keys) {
+            $value = [uint32]0
+            $rc = & $readers[$name] ([ref]$value)
+            $reads[$name] = [ordered]@{ rc = $rc; value = $(if ($rc -eq 0) { $value }) }
+            if ($rc -ne 0) { $failedReads += "$name ($(& $nvmlName $rc))" }
+        }
+        $reasons = [uint64]0
+        $reads.clockReasons = [ordered]@{ rc = [Uv4070.Nvml]::GetClockReasons($Device, [ref]$reasons); value = $reasons }
+        if ($failedReads) {
+            & $add 'lecturas' 'fail' ('fallan: ' + ($failedReads -join ', ')) $reads
+        } else {
+            & $add 'lecturas' 'ok' ('núcleo {0} MHz, {1} °C, {2:N1} W' -f $reads.coreMHz.value, $reads.tempC.value, ($reads.powerMilliwatts.value / 1000)) $reads
+        }
+
+        # Las dos API de offset, por separado.
+        $m = 0; $mMin = 0; $mMax = 0; $l = 0; $lMin = 0; $lMax = 0
+        $modernRc = [Uv4070.Nvml]::GetOffsetModern($Device, [ref]$m, [ref]$mMin, [ref]$mMax)
+        $legacyRc = [Uv4070.Nvml]::GetOffsetLegacy($Device, [ref]$l, [ref]$lMin, [ref]$lMax)
+        $offsetData = [ordered]@{
+            modern = [ordered]@{ rc = $modernRc; mhz = $m; min = $mMin; max = $mMax }
+            legacy = [ordered]@{ rc = $legacyRc; mhz = $l; min = $lMin; max = $lMax }
+        }
+        $offsetDetail = 'API moderna: {0}; anterior: {1}' -f
+            $(if ($modernRc -eq 0) { "+$m MHz (rango $mMin..$mMax)" } else { & $nvmlName $modernRc }),
+            $(if ($legacyRc -eq 0) { "+$l MHz (rango $lMin..$lMax)" } else { & $nvmlName $legacyRc })
+        & $add 'lectura-offset' $(if ($modernRc -eq 0 -or $legacyRc -eq 0) { 'ok' } else { 'fail' }) $offsetDetail $offsetData
+
+        # Tope de reloj: sin suelo (0) o con el de 210 MHz.
+        $rc0 = [Uv4070.Nvml]::SetLockedClocks($Device, 0, $SafeMHz)
+        $rc210 = $null
+        if ($rc0 -ne 0) { $rc210 = [Uv4070.Nvml]::SetLockedClocks($Device, 210, $SafeMHz) }
+        $capOk = $rc0 -eq 0 -or $rc210 -eq 0
+        $capDetail = if ($rc0 -eq 0) { "acepta tope sin suelo (0-$SafeMHz MHz)" } elseif ($rc210 -eq 0) { "necesita suelo de 210 MHz ($(& $nvmlName $rc0) sin él)" } else { 'no acepta topes: ' + (& $nvmlName $rc210) }
+        & $add 'tope-reloj' $(if ($capOk) { 'ok' } else { 'fail' }) $capDetail @{ rcNoFloor = $rc0; rcFloor210 = $rc210 }
+
+        # Offset de +15 MHz, solo con el tope puesto (sin tope sería un overclock).
+        if ($capOk) {
+            $setModern = [Uv4070.Nvml]::SetOffsetModern($Device, 15)
+            $setLegacy = $null
+            if ($setModern -ne 0) { $setLegacy = [Uv4070.Nvml]::SetOffsetLegacy($Device, 15) }
+            $after = Get-CoreOffset $Device
+            $back = [Uv4070.Nvml]::SetGraphicsOffset($Device, 0)
+            $final = Get-CoreOffset $Device
+            $applied = $null -ne $after -and $after.MHz -eq 15
+            $restored = $back -eq 0 -and $null -ne $final -and $final.MHz -eq 0
+            $via = if ($setModern -eq 0) { 'API moderna' } elseif ($setLegacy -eq 0) { "API anterior (moderna: $(& $nvmlName $setModern))" } else { 'ninguna' }
+            $detail = '+15 MHz por {0}, lectura {1}, vuelta a 0: {2}' -f $via, $(if ($after) { "+$($after.MHz) MHz" } else { 'n/d' }), $(if ($restored) { 'sí' } else { 'no' })
+            & $add 'escritura-offset' $(if ($applied -and $restored) { 'ok' } else { 'fail' }) $detail @{
+                setModern = $setModern; setLegacy = $setLegacy; readback = $(if ($after) { $after.MHz }); reset = $back; readbackAfterReset = $(if ($final) { $final.MHz })
+            }
+        } else {
+            & $add 'escritura-offset' 'fail' 'no se prueba: sin tope de reloj sería un overclock' $null
+        }
+
+        # Límite de potencia al 95 % y de vuelta.
+        $default = $reads.defaultPowerLimitMilliwatts.value
+        if ($null -eq $default) {
+            & $add 'potencia' 'info' 'el driver no da el límite de fábrica: -PowerPct no funcionará (tune no lo usa)' $null
+        } else {
+            try {
+                Set-PowerPct $Device 95 -Quiet
+                $at95 = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerLimit($Device, $out) }
+                Set-PowerPct $Device 100 -Quiet
+                $at100 = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerLimit($Device, $out) }
+                $ok = $null -ne $at95 -and [math]::Abs($at95 - 0.95 * $default) -le 1000 -and $at100 -eq $default
+                & $add 'potencia' $(if ($ok) { 'ok' } else { 'fail' }) ('95 %: {0:N0} W, 100 %: {1:N0} W' -f ($at95 / 1000), ($at100 / 1000)) @{ at95 = $at95; at100 = $at100; default = $default }
+            } catch {
+                & $add 'potencia' 'fail' $_.Exception.Message $null
+            }
+        }
+
+        # Test de estrés DirectX 11.
+        $engine = $null
+        try {
+            $engine = Get-Engine $Device
+            & $add 'directx11' 'ok' ('{0} iteraciones, {1:N1} ms por dispatch' -f $engine.Iterations, $engine.DispatchMs) @{ iterations = $engine.Iterations; dispatchMs = $engine.DispatchMs }
+        } catch {
+            $e = $_.Exception
+            while ($e.InnerException) { $e = $e.InnerException }
+            & $add 'directx11' 'fail' $e.Message $null
+        }
+        if ($engine) {
+            $r = Invoke-Step $Device $SafeMHz 0 5
+            $capHolds = -not $r.Failure -and $r.ClockMHz -le $SafeMHz + 15
+            & $add 'tope-efectivo' $(if ($capHolds) { 'ok' } else { 'fail' }) ('con tope {0} MHz y carga máxima: {1:N0} MHz' -f $SafeMHz, $r.ClockMHz) (ConvertTo-LogResult $r)
+
+            $r = Invoke-Step $Device 0 0 10
+            $p0 = -not $r.Failure -and ($r.P0Pct -lt 0 -or $r.P0Pct -ge 90)
+            $detail = if ($r.Failure) { "de serie: $($r.Failure)" } else {
+                'P0 {0:N0} %, {1:N0} MHz, {2:N0} W, {3} °C, limitado por potencia {4:N0} %, {5:N1} TFLOPS' -f
+                    $r.P0Pct, $r.ClockMHz, $r.Watts, $r.MaxTempC, $r.PowerCappedPct, $r.Tflops
+            }
+            & $add 'carga-de-serie' $(if ($p0) { 'ok' } else { 'fail' }) $detail (ConvertTo-LogResult $r)
+
+            $r = Invoke-Step $Device 0 0 6 ([Uv4070.Stress]::Light)
+            & $add 'reloj-maximo' $(if ($r.Failure) { 'fail' } else { 'info' }) ('{0:N0} MHz con carga ligera (P0 {1:N0} %)' -f $r.ClockMHz, $r.P0Pct) (ConvertTo-LogResult $r)
+
+            $r = Invoke-Step $Device 0 0 6 ([Uv4070.Stress]::Pulses)
+            & $add 'pulsos' $(if ($r.Failure) { 'fail' } else { 'ok' }) $(if ($r.Failure) { $r.Failure } else { 'carga y reposo sin errores' }) (ConvertTo-LogResult $r)
+
+            # El detector tiene que ver un fallo cuando los resultados no cuadran.
+            $engine.Iterations += 8
+            $bad = $engine.Run(1, $Device, [Uv4070.Stress]::Steady)
+            $engine.Iterations -= 8
+            $good = $engine.Run(1, $Device, [Uv4070.Stress]::Steady)
+            $detects = $bad.Errors -gt 0 -and -not $good.Failure
+            & $add 'deteccion-errores' $(if ($detects) { 'ok' } else { 'fail' }) ('fallo simulado: {0} hilos erróneos; después: {1}' -f $bad.Errors, $(if ($good.Failure) { $good.Failure } else { 'sin errores' })) @{
+                simulated = (ConvertTo-LogResult $bad); after = (ConvertTo-LogResult $good)
+            }
+        }
+
+        # Registro de eventos de Windows (reinicios del driver).
+        $search = Search-DriverResets (Get-Date).AddDays(-30)
+        if ($search.Ok) {
+            $recent = @($search.Events | Select-Object -First 10 | ForEach-Object { [ordered]@{ time = $_.TimeCreated.ToString('o'); provider = $_.ProviderName; id = $_.Id } })
+            & $add 'registro-eventos' 'ok' ('{0} reinicios del driver en los últimos 30 días' -f @($search.Events).Count) @{ resets = $recent }
+        } else {
+            & $add 'registro-eventos' $(if ($OnWindows) { 'fail' } else { 'info' }) $search.Error $null
+        }
+
+        # Tarea programada como la de install, pero desactivada y temporal.
+        if (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue) {
+            try {
+                $task = Register-AutostartTask 'uv4070-selftest' $PSCommandPath $true
+                $ok = @($task.Triggers).Count -eq 2 -and $task.Principal.UserId -eq 'SYSTEM'
+                & $add 'tarea-programada' $(if ($ok) { 'ok' } else { 'fail' }) ('{0} disparadores, usuario {1}' -f @($task.Triggers).Count, $task.Principal.UserId) $null
+            } catch {
+                & $add 'tarea-programada' 'fail' $_.Exception.Message $null
+            } finally {
+                Unregister-ScheduledTask -TaskName 'uv4070-selftest' -Confirm:$false -ErrorAction SilentlyContinue
+            }
+        } else {
+            & $add 'tarea-programada' 'info' 'no disponible fuera de Windows' $null
+        }
+    } finally {
+        Close-Engine
+        $saved = $null
+        try { $saved = Read-Config } catch { }
+        if ($saved) { Invoke-Apply $Device $saved } else { [void](Reset-Stock $Device) }
+    }
+
+    $script:SelfTestResults = $results
+    $fails = @($results | Where-Object Status -eq 'fail')
+    Write-Log 'selftest-summary' @{ ok = @($results | Where-Object Status -eq 'ok').Count; fail = $fails.Count; checks = @($results) }
+    Write-Host ''
+    if ($fails.Count) {
+        throw "$($fails.Count) comprobación(es) con FALLO. Ejecuta .\uv4070.cmd report y comparte el archivo para revisarlo."
+    }
+    Write-Host 'Todo correcto: tune, stress y apply deberían funcionar en este PC.' -ForegroundColor Green
+}
+
+# Junta en un archivo JSON el estado, la configuración, el último tune y los
+# registros más recientes, para revisarlo o refinar el ajuste (también con una IA).
+function Export-Report($Device, [string]$OpenError) {
+    $dir = Get-DataDir
+    $readJson = { param($name) $path = Join-Path $dir $name; if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } }
+    $logs = @()
+    $logDir = Join-Path $dir 'logs'
+    if (Test-Path -LiteralPath $logDir) {
+        # Los 3 últimos de cada comando (el nombre es yyyyMMdd-HHmmss-<comando>.jsonl), para que
+        # los apply del arranque no dejen fuera el último tune.
+        $recent = Get-ChildItem -LiteralPath $logDir -Filter '*.jsonl' | Group-Object { $_.BaseName.Substring(16) } |
+            ForEach-Object { $_.Group | Sort-Object Name -Descending | Select-Object -First 3 }
+        foreach ($file in ($recent | Sort-Object Name)) {
+            $events = @(Get-Content -LiteralPath $file.FullName -Encoding UTF8 | Where-Object { $_ } | ForEach-Object {
+                try { $_ | ConvertFrom-Json } catch { [pscustomobject]@{ unparsed = $_ } }
+            })
+            $logs += [ordered]@{ file = $file.Name; events = $events }
+        }
+    }
+    $transcript = Join-Path $dir 'uv4070.log'
+    $autostartLog = $null
+    if (Test-Path -LiteralPath $transcript) {
+        # Sin la cabecera de Start-Transcript, que trae usuario y nombre del equipo.
+        $autostartLog = @(Get-Content -LiteralPath $transcript -Encoding UTF8 | Where-Object { $_ -notmatch '^(Username|RunAs User|Machine|Host Application|Process ID|Configuration Name):' }) -join "`n"
+    }
+    $report = [ordered]@{
+        about = ('Informe de uv4070 ' + $ScriptVersion + ', undervolt de una RTX 4070 por NVML: tope de reloj (cap, MHz) + ' +
+            'offset de la curva V/F (offset, MHz). status = estado actual; tuneReport = resultado del último tune ' +
+            '(stock = de serie, final = configuración elegida); tuneState = tune a medias; autostartLog = última ' +
+            'ejecución de la tarea de inicio; logs = registros JSONL recientes, uno por comando. Eventos: session, gpu, ' +
+            'nvml (escrituras: op, rc 0 = correcto, readback), engine, load (cap 0 = de serie, mode steady/pulses/light, ' +
+            'result.failure null = estable, p0Pct, powerCappedPct = % del tiempo limitado por potencia), tune-* ' +
+            '(decisiones del ajuste), selftest, error y end.')
+        generated = (Get-Date).ToString('o')
+        environment = [ordered]@{ ps = $PSVersionTable.PSVersion.ToString(); edition = $PSVersionTable.PSEdition; os = (Get-OsDescription) }
+        status = $(if ($Device) { Get-StatusInfo $Device } else { [ordered]@{ error = $OpenError } })
+        tuneReport = (& $readJson 'tune-report.json')
+        tuneState = (& $readJson 'tune-state.json')
+        autostartLog = $autostartLog
+        logs = $logs
+    }
+    $json = $report | ConvertTo-Json -Depth 10
+    # Sin el nombre de usuario en las rutas (p. ej. en los errores).
+    if ($env:USERNAME) { $json = $json -replace ('(?i)(\\\\Users\\\\)' + [regex]::Escape($env:USERNAME)), '$1%USERNAME%' }
+    $path = Join-Path (Get-Location).Path ('uv4070-report-{0:yyyyMMdd-HHmmss}.json' -f (Get-Date))
+    [IO.File]::WriteAllText($path, $json, (New-Object Text.UTF8Encoding $false))
+    Write-Host "Informe guardado en: $path"
+    Write-Host 'Lleva el estado, la configuración, el último tune y los registros recientes, sin tu usuario ni el nombre'
+    Write-Host 'del equipo. Puedes adjuntarlo tal cual a una IA o a quien te ayude a revisar o afinar el ajuste.'
 }
 
 # Al cargarlo con ". .\uv4070.ps1" solo se definen las funciones (lo usan las pruebas).
@@ -1263,41 +1642,61 @@ if ($MyInvocation.InvocationName -eq '.') { return }
 
 $script:NvmlOpen = $false
 $exitCode = 0
+$started = Get-Date
+$readOnly = $Command -in 'status', 'monitor', 'report'
 if ($Unattended) {
     $logDir = Get-DataDir
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     Start-Transcript -Path (Join-Path $logDir 'uv4070.log') -Force | Out-Null
 }
 try {
-    if ($Command -notin 'status', 'monitor') { Assert-Admin }
+    if (-not $readOnly) {
+        Assert-Admin
+        Start-Log $Command
+        $arguments = @{}
+        foreach ($key in $Bound.Keys) { $arguments[$key] = "$($Bound[$key])" }
+        Write-Log 'session' @{
+            version = $ScriptVersion; command = $Command; arguments = $arguments
+            ps = $PSVersionTable.PSVersion.ToString(); edition = $PSVersionTable.PSEdition; os = (Get-OsDescription)
+        }
+    }
     # Antes de abrir la GPU, para que funcione aunque ya no haya una 4070.
     if ($Command -eq 'uninstall') { Uninstall-Autostart }
 
-    $device = Open-Rtx4070 $Unattended.IsPresent
-    switch ($Command) {
-        'status'  { Show-Status $device }
-        'monitor' { Show-Monitor $device $Samples }
-        'tune' {
-            Write-AfterburnerWarning
-            Invoke-Tune $device
-        }
-        'stress' {
-            Write-AfterburnerWarning
-            Invoke-StressTest $device (Resolve-Config $false) $Minutes
-        }
-        'apply' {
-            Write-AfterburnerWarning
-            Invoke-Apply $device (Resolve-Config $true)
-        }
-        'install' {
-            $config = Resolve-Config $true
-            Invoke-Apply $device $config
-            Save-Config $config
-            Install-Autostart
-        }
-        { $_ -in 'reset', 'uninstall' } {
-            if (-not (Reset-Stock $device)) { throw 'No se pudo restaurar todo; reinicia el PC para volver a fábrica.' }
-            Write-Host 'Valores de fábrica restaurados.'
+    if ($Command -eq 'report') {
+        $device = $null
+        $openError = $null
+        try { $device = Open-Rtx4070 $false } catch { $openError = $_.Exception.Message }
+        Export-Report $device $openError
+    } else {
+        $device = Open-Rtx4070 $Unattended.IsPresent
+        Write-Log 'gpu' @{ name = $GpuName; driver = (Get-DriverVersion) }
+        switch ($Command) {
+            'status'   { Show-Status $device }
+            'monitor'  { Show-Monitor $device $Samples }
+            'selftest' { Invoke-SelfTest $device }
+            'tune' {
+                Write-AfterburnerWarning
+                Invoke-Tune $device
+            }
+            'stress' {
+                Write-AfterburnerWarning
+                Invoke-StressTest $device (Resolve-Config $false) $Minutes
+            }
+            'apply' {
+                Write-AfterburnerWarning
+                Invoke-Apply $device (Resolve-Config $true)
+            }
+            'install' {
+                $config = Resolve-Config $true
+                Invoke-Apply $device $config
+                Save-Config $config
+                Install-Autostart
+            }
+            { $_ -in 'reset', 'uninstall' } {
+                if (-not (Reset-Stock $device)) { throw 'No se pudo restaurar todo; reinicia el PC para volver a fábrica.' }
+                Write-Host 'Valores de fábrica restaurados.'
+            }
         }
     }
 } catch {
@@ -1305,10 +1704,13 @@ try {
     $e = $_.Exception
     while ($e.InnerException) { $e = $e.InnerException }
     Write-Host ('ERROR: ' + $e.Message) -ForegroundColor Red
+    Write-Log 'error' @{ message = $e.Message; type = $e.GetType().FullName; at = $_.InvocationInfo.PositionMessage; stack = $_.ScriptStackTrace }
     $exitCode = 1
 } finally {
     Close-Engine
     if ($script:NvmlOpen) { [void][Uv4070.Nvml]::Shutdown() }
+    Write-Log 'end' @{ exitCode = $exitCode; seconds = [math]::Round(((Get-Date) - $started).TotalSeconds) }
+    if ($script:LogPath -and -not $Unattended) { Write-Host "Registro (JSON Lines): $script:LogPath" }
     if ($Unattended) { Stop-Transcript | Out-Null }
 }
 exit $exitCode
