@@ -1083,7 +1083,8 @@ void main(uint3 id : SV_DispatchThreadID)
             d.Width = size; d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1;
             d.SampleCount = 1; d.Layout = 1 /* ROW_MAJOR */; d.Flags = flags;
             IntPtr resource;
-            Com.Check(Com.Fn<CreateCommittedResourceFn>(device, 27)(device, ref heap, 0, ref d, state, IntPtr.Zero, ref IidResource, out resource), "CreateCommittedResource");
+            Com.Check(Com.Fn<CreateCommittedResourceFn>(device, 27)(device, ref heap, 0, ref d, state, IntPtr.Zero, ref IidResource, out resource),
+                "CreateCommittedResource (" + size + " bytes, heap " + heapType + ", flags 0x" + flags.ToString("X") + ", estado 0x" + state.ToString("X") + ")");
             return resource;
         }
 
