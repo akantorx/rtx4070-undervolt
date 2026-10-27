@@ -20,6 +20,7 @@ $env:PATH = "$MockDir;$env:PATH"
 . $uv
 
 $Yes = $true
+$MaxLossPct = 3   # las cifras de estas pruebas están calculadas con un 3 %
 $script:Failures = 0
 $warp = 'Microsoft Basic Render Driver'
 
