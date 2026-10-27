@@ -33,9 +33,12 @@ que "subir la curva y aplanarla" en Afterburner.
    una carga ligera, como la de un juego que no llega al límite de potencia.
 2. **Fija el tope** un 3 % por debajo de ese reloj máximo y **sube el offset**, es decir, baja la
    tensión, de 30 en 30 MHz. Cada paso pasa el test de estrés completo. Al primer fallo afina en pasos de 15 y deja
-   **30 MHz de margen** bajo el último valor estable. Si en algún momento más offset ya no reduce el
-   consumo (la tensión ya está en el mínimo de la curva), se detiene sin arriesgar más.
+   **30 MHz de margen** bajo el último valor estable. Si dos pasos seguidos más offset ya no reduce el
+   consumo (la tensión ya está en el mínimo de la curva), se detiene sin arriesgar más. Mientras la GPU
+   está pegada al límite de potencia el consumo no baja aunque el undervolt avance, así que ahí no cuenta.
 3. **Confirma** el resultado con unos 10 minutos más de estrés. Si falla, baja 15 MHz y vuelve a confirmar.
+   Al final vuelve a medir la tarjeta de serie, ya caliente, para que la comparación sea justa. Si tenías
+   un límite de potencia guardado (`install -PowerPct`), lo conserva.
 
 ¿Por qué así? La parte alta de la curva es donde la 4070 gasta más tensión para muy poco reloj. Renunciar
 a ese 3 % y quitarle a la vez la tensión que tu chip no necesita es lo que más reduce el consumo. Además,
@@ -68,6 +71,9 @@ Para probar tu configuración cuando quieras, por ejemplo tras actualizar el dri
 .\uv4070.cmd stress              # 10 minutos
 .\uv4070.cmd stress -Minutes 60
 ```
+
+Si el test falla, la GPU vuelve a valores de fábrica hasta el próximo `apply` o reinicio; si pasa, la
+configuración se queda aplicada.
 
 ## Otros comandos
 
@@ -128,7 +134,7 @@ IA, o a quien te ayude, para revisar un fallo o afinar el ajuste.
 - RTX 4070 de sobremesa. El script se niega a funcionar con cualquier otra GPU, incluidas la 4070 Super,
   la Ti y la de portátil.
 - Driver de NVIDIA reciente (R555 o posterior recomendado).
-- Terminal **como administrador** para todo salvo `status` y `monitor`.
+- Terminal **como administrador** para todo salvo `status`, `monitor` y `report`.
 - **No lo uses a la vez que** MSI Afterburner, NV-UV o NV-UV Play: tocan los mismos ajustes. Ponlos en
   valores por defecto y quítalos del arranque, o desinstálalos.
 
@@ -183,3 +189,7 @@ La forma de usar NVML para el offset (API moderna `nvmlDeviceSetClockOffsets` en
 vienen de [Green Curve](https://github.com/aufkrawall/green-curve) de aufkrawall (licencia MIT), el mismo
 proyecto en el que se apoyan NV-UV y NV-UV Play. Este repositorio no contiene código de NV-UV, que es
 software cerrado.
+
+## Licencia
+
+MIT. Ver [LICENSE](LICENSE).

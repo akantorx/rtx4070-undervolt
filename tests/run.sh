@@ -152,12 +152,26 @@ run full selftest
 check 'selftest sin la 4070 en DirectX: lo dice y deja la GPU de fábrica' \
     eval '[[ $rc == 1 && $out == *FALLO*directx11* && $out == *"OK     lecturas"* && $(cat $state_file) == "0 0 0 200000" ]]'
 
+STATE='120 0 2610 200000' run full uninstall
+check 'uninstall: vuelve a fábrica' eval '[[ $rc == 0 && $calls == "offset 0|unlock" && $out == *"Valores de fábrica restaurados"* ]]'
+
+MOCK_NVML_NAMES='NVIDIA GeForce RTX 3060' run full uninstall
+check 'uninstall sin la 4070: quita el arranque y avisa, sin error' \
+    eval '[[ $rc == 0 && -z $calls && $out == *"Arranque automático eliminado"* && $out == *"No se restauran"* ]]'
+
 printf '%s\n' '{"t":"2026-01-01T00:00:00","event":"error","stack":"at x, C:\\Users\\pruebauser\\uv4070.ps1: line 1"}' \
     > "$work/pf/uv4070/logs/20000101-000000-tune.jsonl"
-USERNAME=pruebauser run full report
+# Transcript de la tarea de arranque con la cabecera de un Windows en español.
+printf '%s\n' '**********************' 'Inicio de la transcripción de Windows PowerShell' 'Hora de inicio: 20260101000000' \
+    'Nombre de usuario: EQUIPOPRUEBA\pruebauser' 'Usuario de RunAs: NT AUTHORITY\SYSTEM' \
+    'Nombre del equipo: EQUIPOPRUEBA (Microsoft Windows NT 10.0.26100.0)' '**********************' \
+    'Transcripción iniciada; el archivo de salida es C:\Program Files\uv4070\uv4070.log' 'Aplicando: tope 2655 MHz, offset +150 MHz, potencia 100 %' 'Hecho.' \
+    '**********************' 'Fin de la transcripción de Windows PowerShell' 'Hora de finalización: 20260101000005' '**********************' \
+    > "$work/pf/uv4070/uv4070.log"
+USERNAME=pruebauser COMPUTERNAME=EQUIPOPRUEBA run full report
 report=$(ls "$work"/uv4070-report-*.json 2>/dev/null | head -1 || true)
-check 'report: un JSON con estado y registros, sin el usuario' \
-    eval '[[ $rc == 0 && -n $report ]] && grep -q "\"about\"" "$report" && grep -q "20000101-000000-tune.jsonl" "$report" && grep -q "selftest" "$report" && ! grep -q pruebauser "$report" && grep -q "%USERNAME%" "$report"'
+check 'report: un JSON con estado y registros, sin el usuario ni el equipo' \
+    eval '[[ $rc == 0 && -n $report ]] && grep -q "\"about\"" "$report" && grep -q "20000101-000000-tune.jsonl" "$report" && grep -q "selftest" "$report" && grep -q "Hecho" "$report" && ! grep -qi pruebauser "$report" && ! grep -qi equipoprueba "$report" && grep -q "%USERNAME%" "$report"'
 
 run full monitor -Samples 2
 check 'monitor: dos lecturas' \
