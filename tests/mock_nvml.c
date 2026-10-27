@@ -132,6 +132,7 @@ EXPORT int nvmlDeviceGetClockInfo(void* d, unsigned type, unsigned* mhz) {
 EXPORT int nvmlDeviceGetTemperature(void* d, unsigned sensor, unsigned* c) { *c = 58; return OK; }
 EXPORT int nvmlDeviceGetPowerUsage(void* d, unsigned* mw) { *mw = 151234; return OK; }
 EXPORT int nvmlDeviceGetEnforcedPowerLimit(void* d, unsigned* mw) { *mw = load().powerLimit; return OK; }
+EXPORT int nvmlDeviceGetPowerManagementLimit(void* d, unsigned* mw) { *mw = load().powerLimit; return OK; }
 EXPORT int nvmlDeviceGetPowerManagementDefaultLimit(void* d, unsigned* mw) { *mw = 200000; return OK; }
 EXPORT int nvmlDeviceGetPowerManagementLimitConstraints(void* d, unsigned* mn, unsigned* mx) { *mn = 120000; *mx = 220000; return OK; }
 

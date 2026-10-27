@@ -165,6 +165,9 @@ namespace Uv4070 {
         public static extern int GetPowerUsage(IntPtr device, out uint milliwatts);
         [DllImport(Dll, CallingConvention = C, EntryPoint = "nvmlDeviceGetEnforcedPowerLimit")]
         public static extern int GetPowerLimit(IntPtr device, out uint milliwatts);
+        // El límite configurado: el "en vigor" (GetPowerLimit) tarda en reflejar una escritura.
+        [DllImport(Dll, CallingConvention = C, EntryPoint = "nvmlDeviceGetPowerManagementLimit")]
+        public static extern int GetPowerManagementLimit(IntPtr device, out uint milliwatts);
         [DllImport(Dll, CallingConvention = C, EntryPoint = "nvmlDeviceGetPowerManagementDefaultLimit")]
         public static extern int GetDefaultPowerLimit(IntPtr device, out uint milliwatts);
         [DllImport(Dll, CallingConvention = C, EntryPoint = "nvmlDeviceGetPowerManagementLimitConstraints")]
@@ -353,9 +356,10 @@ namespace Uv4070 {
     // pone los dispatches y la lectura del contador de errores.
     public abstract class Engine : IDisposable {
         // Modos de Run: carga máxima sostenida; 2 s de carga y 0,7 s de reposo
-        // (cambios bruscos de carga y tensión); y carga ligera (un 25 % del
-        // tiempo), con la que la GPU sube a su reloj máximo sin tocar el límite
-        // de potencia, como en un juego.
+        // (cambios bruscos de carga y tensión); y carga ligera: ráfagas de carga
+        // máxima con un goteo de trabajo entre ellas, para que la GPU siga ocupada
+        // (si se queda vacía el driver sale de P0) pero consuma poco y suba a su
+        // reloj máximo sin tocar el límite de potencia, como en un juego.
         public const int Steady = 0, Pulses = 1, Light = 2;
         public const uint MaxIterations = 1u << 22;
         const double BatchMs = 50;
@@ -374,14 +378,17 @@ namespace Uv4070 {
         protected abstract void SetParams(uint iterations, uint verify);
         protected abstract void ClearErrors();
         // Encola perBatch dispatches y la copia del contador de errores al slot.
-        protected abstract void Submit(int slot, int perBatch);
+        // Con light, además el goteo de trabajo que sigue a la ráfaga.
+        protected abstract void Submit(int slot, int perBatch, bool light);
+        // Ajusta el goteo de la carga ligera, si el motor lo tiene.
+        protected virtual void CalibrateLight(double targetMs) { }
         // Espera al lote del slot y lee su contador; false si el dispositivo se ha perdido.
         protected abstract bool ReadErrors(int slot, out long count);
         protected abstract void ReleaseAll(bool wasLost);
 
         double TimeDispatch() {
             Stopwatch sw = Stopwatch.StartNew();
-            Submit(0, 1);
+            Submit(0, 1, false);
             long ignored;
             if (!ReadErrors(0, out ignored)) throw new InvalidOperationException("El driver se ha reiniciado durante la calibración.");
             return sw.Elapsed.TotalMilliseconds;
@@ -401,6 +408,7 @@ namespace Uv4070 {
                     double scaled = iterations * targetMs / Math.Max(ms, 0.001);
                     Iterations = (uint)Math.Max(MinIterations, Math.Min(MaxIterations, scaled));
                     DispatchMs = ms * Iterations / iterations;
+                    CalibrateLight(targetMs);
                     return;
                 }
                 iterations *= 4;
@@ -410,12 +418,12 @@ namespace Uv4070 {
         // Calcula los hashes de referencia y comprueba que se repiten.
         public void CaptureReference() {
             SetParams(Iterations, 0);
-            Submit(0, 1);
+            Submit(0, 1, false);
             long ignored;
             if (!ReadErrors(0, out ignored)) throw new InvalidOperationException("El driver se ha reiniciado al preparar el test.");
             ClearErrors();
             SetParams(Iterations, 1);
-            Submit(0, 3);
+            Submit(0, 3, false);
             long count;
             if (!ReadErrors(0, out count)) throw new InvalidOperationException("El driver se ha reiniciado al preparar el test.");
             if (count != 0) throw new InvalidOperationException("La GPU no repite sus resultados ni con reloj bajo y sin undervolt.");
@@ -439,7 +447,7 @@ namespace Uv4070 {
             while (r.Failure == null && total.Elapsed.TotalSeconds < seconds) {
                 // Varios lotes en vuelo para que la GPU no espere a la CPU.
                 while (queue.Count < depth) {
-                    Submit(next, perBatch);
+                    Submit(next, perBatch, mode == Light);
                     queue.Add(next);
                     next = (next + 1) % Slots;
                 }
@@ -450,11 +458,7 @@ namespace Uv4070 {
                 skip = false;
                 r.Batches++;
                 sampler.Sample();
-                if (mode == Light) {
-                    Thread.Sleep((int)(3 * DispatchMs) + 1);
-                    lastDone = total.Elapsed.TotalMilliseconds;
-                    skip = true;
-                }
+                if (mode == Light) skip = true;  // el lote lleva el goteo: el rendimiento no es comparable
                 if (mode == Pulses && burst.Elapsed.TotalSeconds >= 2) {
                     while (queue.Count > 0 && Complete(Dequeue(queue), r)) { }
                     if (r.Failure != null) break;
@@ -573,8 +577,14 @@ void main(uint3 id : SV_DispatchThreadID)
     }
     [unroll] for (k = 1; k < 8; k++) h = (h ^ asuint(x[k])) * 16777619u;
     if (Verify == 0) Reference[id.x] = h;
-    else if (Reference[id.x] != h) InterlockedAdd(Errors[0], 1);
+    else if (Verify == 1) { if (Reference[id.x] != h) InterlockedAdd(Errors[0], 1); }
+    else if (h == 0x9e3779b9u) InterlockedAdd(Errors[1], 1);  // relleno: solo evita que se elimine el cálculo
 }";
+
+        // Goteo de la carga ligera: unos pocos grupos (pocos SM) entre ráfaga y ráfaga.
+        const uint TrickleGroups = 4;
+        uint trickleIterations = 64;
+        int trickleCount = 1;
 
         [StructLayout(LayoutKind.Sequential)]
         struct BufferDesc { public uint ByteWidth, Usage, BindFlags, CpuAccessFlags, MiscFlags, StructureByteStride; }
@@ -709,10 +719,36 @@ void main(uint3 id : SV_DispatchThreadID)
             clearUav(context, errorsView, new uint[4]);
         }
 
-        protected override void Submit(int slot, int perBatch) {
+        protected override void Submit(int slot, int perBatch, bool light) {
             for (int i = 0; i < perBatch; i++) dispatch(context, Groups, 1, 1);
+            if (light) {
+                SetParams(trickleIterations, 2);
+                for (int i = 0; i < trickleCount; i++) dispatch(context, TrickleGroups, 1, 1);
+                SetParams(Iterations, 1);
+            }
             copyResource(context, staging[slot], errors);
             flush(context);
+        }
+
+        // El goteo dura unas 3 veces la ráfaga: la GPU está ocupada todo el tiempo
+        // pero a un cuarto de su consumo. Se mide con un bloque solo en un SM.
+        protected override void CalibrateLight(double targetMs) {
+            uint probe = Math.Min(MaxIterations, Iterations * 16);
+            SetParams(probe, 2);
+            double ms = double.MaxValue;
+            for (int i = 0; i < 3; i++) {
+                Stopwatch sw = Stopwatch.StartNew();
+                dispatch(context, TrickleGroups, 1, 1);
+                copyResource(context, staging[0], errors);
+                flush(context);
+                long ignored;
+                if (!ReadErrors(0, out ignored)) throw new InvalidOperationException("El driver se ha reiniciado durante la calibración.");
+                ms = Math.Min(ms, sw.Elapsed.TotalMilliseconds);
+            }
+            double needed = probe * 3 * targetMs / Math.Max(ms, 0.001);
+            trickleIterations = (uint)Math.Max(64, Math.Min(MaxIterations, needed));
+            trickleCount = (int)Math.Max(1, Math.Ceiling(needed / trickleIterations));
+            SetParams(Iterations, 0);
         }
 
         // Espera a que la GPU termine el lote que copió su contador en staging[slot].
@@ -1206,7 +1242,7 @@ void main(uint3 id : SV_DispatchThreadID)
             Wait(slotFence[0]);
         }
 
-        protected override void Submit(int slot, int perBatch) {
+        protected override void Submit(int slot, int perBatch, bool light) {
             if (Lost) return;
             Begin(slot);
             setRootSignature(list, rootSignature);
@@ -1428,7 +1464,7 @@ function Set-PowerPct($Device, [int]$Pct, [switch]$Quiet) {
     if ([Uv4070.Nvml]::GetPowerLimitRange($Device, [ref]$min, [ref]$max) -eq 0) {
         $target = [math]::Min([math]::Max($target, $min), $max)
     }
-    $current = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerLimit($Device, $out) }
+    $current = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerManagementLimit($Device, $out) }
     if ($current -eq $target) { return }
     $watts = '{0:N0} W' -f ($target / 1000)
     $rc = [Uv4070.Nvml]::SetPowerLimit($Device, $target)
@@ -1456,7 +1492,7 @@ function Invoke-Reset($Device) {
 }
 
 # Devuelve $false si algo no se pudo restaurar.
-function Reset-Stock($Device) {
+function Reset-Stock($Device, [switch]$Quiet) {
     $ok = $true
     # Al revés que Set-Uv: primero el offset y luego el tope. Si el offset no
     # baja a 0, el tope se queda puesto para no convertirlo en un overclock.
@@ -1473,7 +1509,7 @@ function Reset-Stock($Device) {
             $ok = $false
         }
     }
-    try { Set-PowerPct $Device 100 } catch { Write-Warning $_.Exception.Message; $ok = $false }
+    try { Set-PowerPct $Device 100 -Quiet:$Quiet } catch { Write-Warning $_.Exception.Message; $ok = $false }
     return $ok
 }
 
@@ -1598,7 +1634,7 @@ function Search-DriverResets([datetime]$Since) {
 function Invoke-Step($Device, [int]$Cap, [int]$Offset, [double]$Seconds, [int]$Mode = 0) {
     $runMode = $Mode
     if ($Mode -eq $RtMode) { $engine = Get-RtEngine $Device; $runMode = [Uv4070.Stress]::Steady } else { $engine = Get-Engine $Device }
-    if ($Cap -gt 0) { Set-Uv $Device $Cap $Offset } else { [void](Reset-Stock $Device) }
+    if ($Cap -gt 0) { Set-Uv $Device $Cap $Offset } else { [void](Reset-Stock $Device -Quiet) }
     $since = Get-Date
     $left = $Seconds * $TestScale
     do {
@@ -2082,6 +2118,7 @@ function Invoke-SelfTest($Device) {
             tempC = { param($o) [Uv4070.Nvml]::GetTemperature($Device, 0, $o) }
             powerMilliwatts = { param($o) [Uv4070.Nvml]::GetPowerUsage($Device, $o) }
             powerLimitMilliwatts = { param($o) [Uv4070.Nvml]::GetPowerLimit($Device, $o) }
+            powerManagementLimitMilliwatts = { param($o) [Uv4070.Nvml]::GetPowerManagementLimit($Device, $o) }
             defaultPowerLimitMilliwatts = { param($o) [Uv4070.Nvml]::GetDefaultPowerLimit($Device, $o) }
             pstate = { param($o) [Uv4070.Nvml]::GetPState($Device, $o) }
         }
@@ -2145,10 +2182,11 @@ function Invoke-SelfTest($Device) {
             & $add 'potencia' 'info' 'el driver no da el límite de fábrica: -PowerPct no funcionará (tune no lo usa)' $null
         } else {
             try {
+                # Se lee el límite configurado: el "en vigor" tarda en reflejar la escritura.
                 Set-PowerPct $Device 95 -Quiet
-                $at95 = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerLimit($Device, $out) }
+                $at95 = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerManagementLimit($Device, $out) }
                 Set-PowerPct $Device 100 -Quiet
-                $at100 = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerLimit($Device, $out) }
+                $at100 = Read-Nvml { param($out) [Uv4070.Nvml]::GetPowerManagementLimit($Device, $out) }
                 $ok = $null -ne $at95 -and [math]::Abs($at95 - 0.95 * $default) -le 1000 -and $at100 -eq $default
                 & $add 'potencia' $(if ($ok) { 'ok' } else { 'fail' }) ('95 %: {0:N0} W, 100 %: {1:N0} W' -f ($at95 / 1000), ($at100 / 1000)) @{ at95 = $at95; at100 = $at100; default = $default }
             } catch {

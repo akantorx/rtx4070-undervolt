@@ -76,9 +76,10 @@ que pone a trabajar todas las unidades FP32 de la GPU, y un shader de ray tracin
   compilador de ese shader, así que va compilado y embebido en el script (`tests/build-rt-shader.ps1`).
 - No solo prueba el tope: también 300, 600 y 900 MHz por debajo, porque el offset desplaza toda la curva
   y cada reloj usa su propio punto de tensión. Con carga máxima la 4070 se queda en el límite de
-  potencia y no llega al tope, así que añade un tramo de carga ligera, con el que el reloj se queda
-  clavado en el tope como en un juego. Y pulsos de carga y reposo, que es donde muchos undervolts
-  fallan, en los cambios bruscos de tensión.
+  potencia y no llega al tope, así que añade un tramo de carga ligera (ráfagas de carga máxima con un
+  goteo de trabajo entre ellas: la GPU sigue ocupada, como en un juego, pero a un cuarto del consumo)
+  con el que el reloj se queda clavado en el tope. Y pulsos de carga y reposo, que es donde muchos
+  undervolts fallan, en los cambios bruscos de tensión.
 - Cuenta como fallo cualquier reinicio del driver (TDR), tanto si lo nota DirectX como si aparece en el
   registro de eventos de Windows.
 
