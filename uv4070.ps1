@@ -1272,7 +1272,7 @@ function Invoke-Tune($Device) {
         if ($config.PowerPct -ne 100) { Set-PowerPct $Device $config.PowerPct }
         $highest = Get-HighestPass $state.Passed $state.Failed
         $summary = [ordered]@{
-            version = $ScriptVersion; tuned = $config.Tuned; driver = $driver; lossPct = $MaxLossPct; marginMHz = $MarginMHz
+            version = $ScriptVersion; tuned = $config.Tuned; driver = $driver; lossPct = $MaxLossPct; requestedMarginMHz = $MarginMHz
             config = $config; boostMHz = $state.BoostMHz; stock = $stock; stockCold = $state.Baseline; final = $final
             highestStableOffset = $highest; marginMHz = $highest - $offset; passed = $state.Passed; failed = $state.Failed; plateau = $state.Plateau
         }
