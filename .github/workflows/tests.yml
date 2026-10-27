@@ -36,8 +36,17 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/mock" /c/tmp
           gcc -shared -O2 -Wall -Werror -o "$RUNNER_TEMP/mock/nvml.dll" tests/mock_nvml.c
-      - name: tests/windows.tests.ps1 con ${{ matrix.shell }}
-        shell: ${{ matrix.shell }}
+      # shell no admite expresiones: un paso por cada PowerShell.
+      - name: tests/windows.tests.ps1 con Windows PowerShell 5.1
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        env:
+          MOCK_NVML_STATE: C:\tmp\mock_nvml_state
+          MOCK_NVML_LOG: C:\tmp\mock_nvml_log
+        run: ./tests/windows.tests.ps1 -MockDir "$env:RUNNER_TEMP\mock" -ArtifactsDir "$env:RUNNER_TEMP\artifacts"
+      - name: tests/windows.tests.ps1 con PowerShell 7
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
         env:
           MOCK_NVML_STATE: C:\tmp\mock_nvml_state
           MOCK_NVML_LOG: C:\tmp\mock_nvml_log
