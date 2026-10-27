@@ -973,15 +973,18 @@ function Search-DriverResets([datetime]$Since) {
     if (-not (Get-Command Get-WinEvent -ErrorAction SilentlyContinue)) {
         return [pscustomobject]@{ Ok = $false; Error = 'Get-WinEvent no existe aquí'; Events = @() }
     }
-    try {
-        $filter = @{ LogName = 'System'; ProviderName = 'nvlddmkm', 'Display'; StartTime = $Since }
-        $events = Get-WinEvent -FilterHashtable $filter -ErrorAction Stop
-    } catch {
-        # Sin eventos que coincidan, Get-WinEvent da este error: no es un fallo.
-        if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') { return [pscustomobject]@{ Ok = $true; Error = $null; Events = @() } }
-        return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message; Events = @() }
+    $resets = @()
+    # Un proveedor cada vez: sin driver de NVIDIA no existe nvlddmkm, y eso no debe tapar Display.
+    foreach ($provider in 'nvlddmkm', 'Display') {
+        try {
+            $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = $provider; StartTime = $Since } -ErrorAction Stop
+        } catch {
+            # Sin eventos que coincidan, o sin ese proveedor, Get-WinEvent da error: no es un fallo.
+            if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound|NoMatchingProvider') { continue }
+            return [pscustomobject]@{ Ok = $false; Error = "$($_.FullyQualifiedErrorId): $($_.Exception.Message)"; Events = @() }
+        }
+        $resets += @($events | Where-Object { ($_.ProviderName -eq 'nvlddmkm' -and $_.Level -le 2) -or $_.Id -eq 4101 })
     }
-    $resets = @($events | Where-Object { ($_.ProviderName -eq 'nvlddmkm' -and $_.Level -le 2) -or $_.Id -eq 4101 })
     [pscustomobject]@{ Ok = $true; Error = $null; Events = $resets }
 }
 
