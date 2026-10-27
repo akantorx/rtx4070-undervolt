@@ -20,6 +20,7 @@ $env:PATH = "$MockDir;$env:PATH"
 . $uv
 
 $Yes = $true
+$MaxLossPct = 3   # las cifras de estas pruebas están calculadas con un 3 %
 $script:Failures = 0
 $warp = 'Microsoft Basic Render Driver'
 
@@ -61,12 +62,29 @@ try {
 $message = try { [Uv4070.Stress]::Open($GpuName).Dispose(); 'abrió' } catch { $_.Exception.InnerException.Message }
 Check 'DirectX: sin la 4070 lo dice y lista los adaptadores' ($message -match 'DirectX no encuentra' -and $message -match [regex]::Escape($warp)) $message
 
+# --- Test de ray tracing (DirectX 12, DXR 1.1) sobre WARP ---
+$warpRt = [Uv4070.RtStress]::Open($warp)
+try {
+    $warpRt.Calibrate(15)
+    $warpRt.CaptureReference()
+    Check ('WARP RT: calibración y referencia ({0} rayos por hilo, {1:N1} ms por dispatch)' -f $warpRt.Iterations, $warpRt.DispatchMs) ($warpRt.Iterations -ge 1 -and $warpRt.DispatchMs -gt 0)
+    # Sin núcleos RT cada dispatch tarda varios segundos: en 3 s puede completarse un solo lote.
+    $r = $warpRt.Run(3, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
+    Check 'WARP RT: carga sostenida sin errores' (-not $r.Failure -and $r.Batches -ge 1) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
+    $warpRt.Iterations += 1
+    $r = $warpRt.Run(1, [IntPtr]::Zero, [Uv4070.Stress]::Steady)
+    Check 'WARP RT: detecta resultados erróneos' ($r.Failure -eq 'errores de cálculo' -and $r.Errors -ge [Uv4070.RtStress]::Threads) (ConvertTo-LogResult $r | ConvertTo-Json -Compress)
+} finally {
+    $warpRt.Dispose()
+}
+
 # --- Registro de eventos ---
 $search = Search-DriverResets (Get-Date).AddDays(-30)
 Check 'registro de eventos: la consulta de nvlddmkm y Display funciona' $search.Ok $search.Error
 
 # --- selftest y tune con el motor real (WARP) y el NVML simulado ---
 function New-StressEngine { [Uv4070.Stress]::Open($warp) }
+function New-RtStressEngine { [Uv4070.RtStress]::Open($warp) }
 function Install-Autostart { }
 $TestScale = 0.05
 $env:ProgramFiles = Join-Path ([IO.Path]::GetTempPath()) ('uv4070-ci-' + [guid]::NewGuid())
@@ -85,8 +103,9 @@ Set-Content -LiteralPath $env:MOCK_NVML_STATE -Value '0 0 0 200000'
 Start-Log 'tune'
 $out = try { Invoke-Tune $device *>&1 | Out-String } catch { 'EXCEPCION: ' + $_.Exception.Message }
 $config = Read-Config
-# El NVML simulado da siempre el mismo consumo: tune para en la meseta tras +60 y deja +30.
-Check 'tune con el motor real (WARP): termina y guarda la configuración' ($out -notmatch 'EXCEPCION' -and $config.MaxMHz -eq 2715 -and $config.OffsetMHz -eq 30) $out
+# El NVML simulado da siempre el mismo consumo y, con tope, no está limitado por potencia: tune
+# para en la meseta tras dos pasos sin bajar (+60 y +90) y deja +60.
+Check 'tune con el motor real (WARP): termina y guarda la configuración' ($out -notmatch 'EXCEPCION' -and $config.MaxMHz -eq 2715 -and $config.OffsetMHz -eq 60) $out
 $events = @(Get-Content -LiteralPath $script:LogPath -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
 Check 'registro de tune: JSON válido con los resultados reales del motor' (@($events | Where-Object { $_.event -eq 'load' -and $_.result.batches -gt 0 }).Count -gt 5) ($events.Count)
 Close-Engine

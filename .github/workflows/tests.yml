@@ -1,4 +1,4 @@
-name: tests
+﻿name: tests
 
 on:
   push:
@@ -17,6 +17,13 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq mono-mcs
       - name: tests/run.sh (PowerShell 7)
         run: tests/run.sh
+      - name: PSScriptAnalyzer (solo errores)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $findings = @(Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error)
+          $findings | Format-Table -AutoSize | Out-String | Write-Host
+          if ($findings.Count) { exit 1 }
 
   windows:
     runs-on: windows-latest
@@ -26,6 +33,9 @@ jobs:
         shell: [powershell, pwsh]   # Windows PowerShell 5.1 y PowerShell 7
     steps:
       - uses: actions/checkout@v4
+      - name: Shader de ray tracing, compilado con dxc, contra el DXIL embebido
+        shell: pwsh
+        run: ./tests/build-rt-shader.ps1
       - name: tests/run.sh con ${{ matrix.shell }}
         shell: bash
         env:
